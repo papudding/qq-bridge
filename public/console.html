@@ -2052,6 +2052,7 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendVoice"> <span><b>qq_send_voice / qq_list_voices</b><span class="meta">发送语音条（只能发语音库里的音频；偶然而为的强表达）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendImage"> <span><b>qq_send_image</b><span class="meta">发送图片库里的文件或 http(s) 图片（单独一条消息，不能带文字）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="genImage"> <span><b>qq_gen_image</b><span class="meta">用 MiniMax 现场画图并发送（消耗订阅额度）</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="genVoice"> <span><b>qq_gen_voice</b><span class="meta">把要说的话合成语音并发送（默认语音回复；消耗订阅额度）</span></span></label>
       </div>
       <div class="meta" style="margin-top:6px">二代黑话学习：AI 可用 <code>qq_slang_submit</code> 提交陌生词，也可由桥接自动提取；管理员在「黑话词库」页面筛选确认后，词条会自动写入黑话提示词并注入 <code>qq_get_prompt</code> 与后续唤醒。</div>
 
@@ -2076,6 +2077,65 @@ button:active:not(:disabled) {
       </div>
 
       </div></details>
+<details class="settings-group"><summary>语音生成（MiniMax）与语音优先</summary><div class="settings-content">
+      <div id="voiceStatusLine" class="meta" style="margin-bottom:8px">状态加载中…</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <label style="flex:0 0 auto"><input type="checkbox" id="voiceEnabled" style="width:auto"> 启用语音发送</label>
+        <label style="flex:0 0 auto"><input type="checkbox" id="voiceGenEnabled" style="width:auto"> 启用 MiniMax 合成</label>
+        <label style="flex:0 0 auto"><input type="checkbox" id="voicePrefer" style="width:auto"> <b>语音优先</b>（AI 默认用语音回话）</label>
+        <label style="flex:0 0 auto"><input type="checkbox" id="voiceAllowAbs" style="width:auto"> 允许发库外绝对路径（慎用）</label>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">API Key</label>
+        <input type="password" id="voiceApiKey" placeholder="留空 = 保持现有 Key（不会回显）" style="flex:1" autocomplete="new-password">
+        <button type="button" class="btn-secondary" id="voiceKeyClearBtn">清除 Key</button>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">站点</label>
+        <select id="voiceBaseUrl" style="width:230px">
+          <option value="https://api.minimax.cn">国内站 api.minimax.cn</option>
+          <option value="https://api.minimax.io">国际站 api.minimax.io</option>
+        </select>
+        <label style="flex:0 0 auto">模型</label><input type="text" id="voiceModel" style="width:130px" value="speech-2.8-hd">
+        <label style="flex:0 0 auto">音色</label><input type="text" id="voiceIdInput" list="voiceIdOptions" style="width:220px" value="female-shaonv">
+        <datalist id="voiceIdOptions"></datalist>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">情绪</label>
+        <select id="voiceEmotion" style="width:110px">
+          <option value="">自动</option><option value="happy">开心</option><option value="sad">难过</option>
+          <option value="angry">生气</option><option value="fearful">害怕</option><option value="disgusted">厌恶</option>
+          <option value="surprised">惊讶</option><option value="neutral">平静</option>
+        </select>
+        <label style="flex:0 0 auto">语速</label><input type="number" id="voiceSpeed" step="0.1" min="0.5" max="2" style="width:80px">
+        <label style="flex:0 0 auto">音量</label><input type="number" id="voiceVol" step="0.1" min="0.1" max="10" style="width:80px">
+        <label style="flex:0 0 auto">音调</label><input type="number" id="voicePitch" step="1" min="-12" max="12" style="width:80px">
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">单条上限（字）</label><input type="number" id="voiceMaxChars" min="50" max="5000" style="width:90px">
+        <label style="flex:0 0 auto">生成超时（秒）</label><input type="number" id="voiceTimeoutSec" min="10" max="300" style="width:90px">
+        <label style="flex:0 0 auto">每分钟最多</label><input type="number" id="voicePerMin" min="0" max="100" style="width:80px">
+        <label style="flex:0 0 auto">每小时最多</label><input type="number" id="voicePerHour" min="0" max="1000" style="width:80px">
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">测试台词</label>
+        <input type="text" id="voiceTestText" placeholder="留空 = 默认测试语音" style="flex:1">
+        <label style="flex:0 0 auto">测试后发到</label>
+        <input type="text" id="voiceTestSendTo" placeholder="可空，如 private:123456" style="width:190px">
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <button type="button" id="voiceTestBtn">生成试听</button>
+        <button type="button" class="btn-secondary" id="voiceStatusRefreshBtn">刷新状态</button>
+        <span id="voiceGenMsg" class="meta"></span>
+        <audio id="voiceTestAudio" controls style="display:none;height:32px"></audio>
+      </div>
+      <div class="meta" style="margin-top:6px">
+        合成走 MiniMax T2A（<code>/v1/t2a_v2</code>），结果存进语音库 <code>qq-bridge/audio/</code>，再由网关转 SILK 发成 QQ 语音条。
+        打开「<b>语音优先</b>」后，AI 每次回话默认先调 <code>qq_gen_voice</code> 发语音；长内容/代码/链接仍用文字。
+        「生成试听」会真实消耗一次 MiniMax 额度；试听音频只在浏览器里播放。
+        AI 侧工具：<code>qq_gen_voice</code>（合成并发送）、<code>qq_send_voice</code>（发语音库现成音频）。
+      </div>
+    </div></details>
 <details class="settings-group"><summary>图片生成（MiniMax）与图片发送</summary><div class="settings-content">
       <div id="imageStatusLine" class="meta" style="margin-bottom:8px">状态加载中…</div>
       <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
@@ -3376,6 +3436,89 @@ async function testImageGeneration() {
   }
 }
 
+// ── 语音生成（MiniMax TTS）状态与测试 ──────────────────────────────────────
+async function loadVoiceStatus() {
+  const line = document.getElementById('voiceStatusLine');
+  if (!line) return;
+  try {
+    const r = await api('/api/socialV2/voice/status');
+    const g = r.generation || {};
+    const st = r.stats || {};
+    const keySrc = g.keySource === 'config' ? 'config.json' : (g.keySource && g.keySource !== 'none' ? g.keySource : '');
+    const keyTxt = g.keyConfigured ? ('已配置' + (keySrc ? '（' + keySrc + '，' + (g.keyMasked || '') + '）' : '')) : '未配置';
+    const last = st.lastAt
+      ? ((st.lastOk ? '成功 ' : '失败 ') + fmtImageTime(st.lastAt)
+        + (st.lastOk
+          ? ('，' + (st.lastLatencyMs || 0) + 'ms，' + (st.lastFile || '') + (st.lastDurationSec ? '，' + st.lastDurationSec + ' 秒' : ''))
+          : ('（' + (st.lastError || '未知错误') + '）')))
+      : '从未生成';
+    line.innerHTML = ''
+      + '<span class="pill ' + (g.keyConfigured ? 'g' : 'r') + '">Key ' + keyTxt + '</span> '
+      + '<span class="pill ' + (r.enabled ? 'g' : 'r') + '">语音发送 ' + (r.enabled ? '开' : '关') + '</span> '
+      + '<span class="pill ' + (g.enabled ? 'g' : 'r') + '">合成 ' + (g.enabled ? '开' : '关') + '</span> '
+      + '<span class="pill ' + (r.prefer ? 'g' : 'r') + '">语音优先 ' + (r.prefer ? '开' : '关') + '</span> '
+      + '模型 <code>' + (g.model || '') + '</code> · 音色 <code>' + (g.voiceId || '') + '</code> · 语音库 <code>' + (r.dir || 'audio') + '/</code>'
+      + '（' + ((r.latest || []).length ? '最近：' + r.latest.join('、') : '空') + '）'
+      + '<br>累计生成 ' + (st.generated || 0) + ' 条 / 失败 ' + (st.failed || 0) + ' 次 / 已发送 ' + (st.sent || 0) + ' 条 · 上次：' + last;
+    const list = document.getElementById('voiceIdOptions');
+    if (list && Array.isArray(r.voices) && r.voices.length) {
+      list.innerHTML = r.voices.map(v => '<option value="' + v.id + '">' + (v.name || v.id) + '</option>').join('');
+    }
+    const sel = document.getElementById('voiceBaseUrl');
+    const want = g.baseUrl || 'https://api.minimax.cn';
+    if (sel) {
+      if (![...sel.options].some(o => o.value === want)) {
+        const opt = document.createElement('option');
+        opt.value = want;
+        opt.textContent = want + '（自定义）';
+        sel.appendChild(opt);
+      }
+      sel.value = want;
+    }
+  } catch (error) {
+    line.textContent = '状态获取失败：' + (error && error.message ? error.message : error);
+  }
+}
+
+async function testVoiceGeneration() {
+  const msg = document.getElementById('voiceGenMsg');
+  const btn = document.getElementById('voiceTestBtn');
+  const text = document.getElementById('voiceTestText').value.trim();
+  const sendTo = document.getElementById('voiceTestSendTo').value.trim();
+  btn.disabled = true;
+  msg.className = 'meta';
+  msg.textContent = '合成中（通常 1~5 秒）…';
+  try {
+    const r = await api('/api/socialV2/voice/test', 'POST', {
+      text: text || undefined,
+      sendTo: sendTo || undefined,
+      voiceId: document.getElementById('voiceIdInput').value.trim() || undefined,
+      emotion: document.getElementById('voiceEmotion').value || undefined,
+      speed: Number(document.getElementById('voiceSpeed').value) || undefined
+    });
+    if (r && r.ok) {
+      msg.className = 'meta ok';
+      msg.textContent = '✅ 已生成 ' + r.filename + '（' + (r.duration ?? '?') + ' 秒，' + r.latencyMs + 'ms，' + (r.voiceId || '') + '）'
+        + (r.sent ? ('，已发到 ' + r.sent.key + '（messageId=' + (r.sent.messageId ?? '?') + '，verified=' + (r.sent.verified === true) + '）') : '，未发送');
+      if (r.audioBase64) {
+        const audio = document.getElementById('voiceTestAudio');
+        audio.src = 'data:' + (r.mimeType || 'audio/mpeg') + ';base64,' + r.audioBase64;
+        audio.style.display = 'inline-block';
+        audio.play().catch(() => {});
+      }
+    } else {
+      msg.className = 'meta err';
+      msg.textContent = '❌ ' + ((r && r.error) || '失败');
+    }
+  } catch (error) {
+    msg.className = 'meta err';
+    msg.textContent = '❌ ' + (error && error.message ? error.message : error);
+  } finally {
+    btn.disabled = false;
+    loadVoiceStatus();
+  }
+}
+
 // ── 二代仿真模式（reserved2）配置 ─────────────────────────────────────────
 async function loadV2Config() {
   try {
@@ -3477,6 +3620,31 @@ async function loadV2Config() {
         : '未配置：粘贴 MiniMax M Plan API Key';
     }
     loadImageStatus();
+    const v = c.voice || {};
+    const vg = v.generation || {};
+    document.getElementById('voiceEnabled').checked = v.enabled === true;
+    document.getElementById('voicePrefer').checked = v.prefer !== false;
+    document.getElementById('voiceGenEnabled').checked = vg.enabled !== false;
+    document.getElementById('voiceAllowAbs').checked = v.allowAbsolutePath === true;
+    document.getElementById('voiceModel').value = vg.model || 'speech-2.8-hd';
+    document.getElementById('voiceIdInput').value = vg.voiceId || 'female-shaonv';
+    document.getElementById('voiceEmotion').value = vg.emotion || '';
+    document.getElementById('voiceSpeed').value = vg.speed ?? 1;
+    document.getElementById('voiceVol').value = vg.vol ?? 1;
+    document.getElementById('voicePitch').value = vg.pitch ?? 0;
+    document.getElementById('voiceMaxChars').value = vg.maxChars ?? 1200;
+    document.getElementById('voiceTimeoutSec').value = Math.round((vg.timeoutMs || 120000) / 1000);
+    document.getElementById('voicePerMin').value = v.maxPerMinute ?? 2;
+    document.getElementById('voicePerHour').value = v.maxPerHour ?? 10;
+    {
+      const keyEl = document.getElementById('voiceApiKey');
+      keyEl.value = '';
+      keyEl.dataset.clear = '0';
+      keyEl.placeholder = vg.apiKeyConfigured
+        ? '已配置（' + (vg.apiKeyMasked || '****') + '，留空保持不变）'
+        : '未配置：可复用图片生成同一个 MiniMax Key';
+    }
+    loadVoiceStatus();
     const ctx = c.context || {};
     document.getElementById('v2ContextRecentLimit').value = ctx.recentLimit ?? 100;
     document.getElementById('v2ContextUnreadLimit').value = ctx.unreadLimit ?? 30;
@@ -3561,6 +3729,34 @@ async function saveV2Config() {
         maxRemarkChars: Math.min(50, Math.max(1, Math.round(Number(document.getElementById('v2StickerCollectRemarkMax').value) || 20)))
       }
     },
+    voice: (() => {
+      const keyEl = document.getElementById('voiceApiKey');
+      const apiKey = keyEl.value.trim();
+      const clearKey = keyEl.dataset.clear === '1' && !apiKey;
+      keyEl.value = '';
+      keyEl.dataset.clear = '0';
+      return {
+        enabled: document.getElementById('voiceEnabled').checked,
+        prefer: document.getElementById('voicePrefer').checked,
+        allowAbsolutePath: document.getElementById('voiceAllowAbs').checked,
+        maxPerMinute: Math.max(0, Math.round(Number(document.getElementById('voicePerMin').value) || 0)),
+        maxPerHour: Math.max(0, Math.round(Number(document.getElementById('voicePerHour').value) || 0)),
+        generation: {
+          enabled: document.getElementById('voiceGenEnabled').checked,
+          baseUrl: document.getElementById('voiceBaseUrl').value,
+          model: document.getElementById('voiceModel').value.trim() || 'speech-2.8-hd',
+          voiceId: document.getElementById('voiceIdInput').value.trim() || 'female-shaonv',
+          emotion: document.getElementById('voiceEmotion').value,
+          speed: Number(document.getElementById('voiceSpeed').value) || 1,
+          vol: Number(document.getElementById('voiceVol').value) || 1,
+          pitch: Number(document.getElementById('voicePitch').value) || 0,
+          maxChars: Math.max(50, Math.min(5000, Math.round(Number(document.getElementById('voiceMaxChars').value) || 1200))),
+          timeoutMs: Math.max(10, Math.min(300, Math.round(Number(document.getElementById('voiceTimeoutSec').value) || 120))) * 1000,
+          apiKey,
+          clearApiKey: clearKey
+        }
+      };
+    })(),
     image: (() => {
       const keyEl = document.getElementById('imageApiKey');
       const apiKey = keyEl.value.trim();
@@ -4016,6 +4212,17 @@ document.getElementById('imageKeyClearBtn').addEventListener('click', () => {
   el.dataset.clear = '1';
   el.placeholder = '保存后清除已配置的 Key';
   const msg = document.getElementById('imageMsg');
+  msg.className = 'meta';
+  msg.textContent = '已标记：点「保存」后才会真正清除 Key';
+});
+document.getElementById('voiceStatusRefreshBtn').addEventListener('click', loadVoiceStatus);
+document.getElementById('voiceTestBtn').addEventListener('click', testVoiceGeneration);
+document.getElementById('voiceKeyClearBtn').addEventListener('click', () => {
+  const el = document.getElementById('voiceApiKey');
+  el.value = '';
+  el.dataset.clear = '1';
+  el.placeholder = '保存后清除已配置的 Key';
+  const msg = document.getElementById('voiceGenMsg');
   msg.className = 'meta';
   msg.textContent = '已标记：点「保存」后才会真正清除 Key';
 });

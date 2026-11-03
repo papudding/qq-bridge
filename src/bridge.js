@@ -37,6 +37,15 @@ import {
   readApiKey,
   saveImageFile
 } from './image-gen.js';
+import {
+  VOICE_GEN_DEFAULTS,
+  VOICE_PREVIEW_TEXT,
+  fetchSystemVoices,
+  generateVoice,
+  listVoiceFiles,
+  normalizeVoiceOptions,
+  saveVoiceFile
+} from './voice-gen.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -82,6 +91,8 @@ const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
 const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 图片生成/发送的累计状态（只存计数与最后一次结果，不存 prompt 原文）。
 const IMAGE_STATS_FILE = path.join(STATE_DIR, 'image-stats.json');
+// 语音生成/发送的累计状态（只存计数与最后一次结果，不存原文）。
+const VOICE_STATS_FILE = path.join(STATE_DIR, 'voice-stats.json');
 // 操作者为每个会话预写的「初始提示词」（见 main() 里的 initialPrompts）。
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
@@ -1001,18 +1012,23 @@ function loadConfig() {
     sendVoice: false,
     sendImage: true,
     genImage: true,
+    genVoice: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
-  // socialV2.voice：语音发送（把准备好的音频文件当 QQ 语音发出去）。
+  // socialV2.voice：语音发送 + MiniMax 语音合成（T2A v2）。
   // dir 为相对仓库根目录的语音库路径；AI 的 qq_send_voice 默认只能从这个目录取文件，
   // 绝对路径需要显式开 allowAbsolutePath（默认关，避免 prompt injection 读到任意本地文件）。
   //
-  // 默认**关闭**（enabled/sendVoice 均为 false）：语音是"开口说话"的强表达，且需要你先准备好
-  // 语音库内容。没放音频就让 AI 发语音只会得到一串错误。把音频放进 audio/ 后，
-  // 在控制台「二代仿真 → 语音库与语音发送」里打开开关即可。
+  // 出厂默认仍是「语音发送关闭」（enabled/sendVoice 均 false）：语音是"开口说话"的强表达，
+  // 需要部署者先准备好语音库/Key。打开 enabled + prefer 后，AI 默认用 qq_gen_voice 合成语音回复。
+  const rawVoiceCfg = (cfg.socialV2?.voice && typeof cfg.socialV2.voice === 'object' && !Array.isArray(cfg.socialV2.voice))
+    ? cfg.socialV2.voice
+    : {};
   cfg.socialV2.voice = {
     enabled: false,
+    // prefer=true 时唤醒提示词会注入「默认语音回复」的强偏好；AI 仍可判断长内容用文字更合适。
+    prefer: true,
     dir: 'audio',
     maxSeconds: 300,
     maxBytes: 20 * 1024 * 1024,
@@ -1025,7 +1041,13 @@ function loadConfig() {
     loudness: 'normal',
     ffmpegPath: '',
     autoReadback: true,
-    ...(cfg.socialV2?.voice ?? {})
+    ...rawVoiceCfg,
+    generation: {
+      ...VOICE_GEN_DEFAULTS,
+      ...((rawVoiceCfg.generation && typeof rawVoiceCfg.generation === 'object' && !Array.isArray(rawVoiceCfg.generation))
+        ? rawVoiceCfg.generation
+        : {})
+    }
   };
 
   // socialV2.image：图片发送 + MiniMax 文生图。
@@ -1967,6 +1989,37 @@ async function main() {
     return st;
   }
 
+  // 语音生成/发送统计：与图片统计同构（只存计数与最后一次结果）。
+  let voiceStatsCache = null;
+  function voiceStats() {
+    if (voiceStatsCache) return voiceStatsCache;
+    let raw = {};
+    try { raw = JSON.parse(fs.readFileSync(VOICE_STATS_FILE, 'utf8')) ?? {}; } catch {}
+    voiceStatsCache = {
+      generated: Number(raw.generated) || 0,
+      failed: Number(raw.failed) || 0,
+      sent: Number(raw.sent) || 0,
+      lastAt: Number(raw.lastAt) || 0,
+      lastOk: raw.lastOk === true,
+      lastError: typeof raw.lastError === 'string' ? raw.lastError : '',
+      lastLatencyMs: Number(raw.lastLatencyMs) || 0,
+      lastFile: typeof raw.lastFile === 'string' ? raw.lastFile : '',
+      lastSource: typeof raw.lastSource === 'string' ? raw.lastSource : '',
+      lastModel: typeof raw.lastModel === 'string' ? raw.lastModel : '',
+      lastVoiceId: typeof raw.lastVoiceId === 'string' ? raw.lastVoiceId : '',
+      lastDurationSec: Number(raw.lastDurationSec) || 0,
+      lastChars: Number(raw.lastChars) || 0
+    };
+    return voiceStatsCache;
+  }
+
+  function commitVoiceStats(patch) {
+    const st = voiceStats();
+    Object.assign(st, patch);
+    try { atomicWriteJson(VOICE_STATS_FILE, st); } catch (error) { log('保存语音统计失败:', error?.message ?? error); }
+    return st;
+  }
+
   /**
    * 生成一张图并落盘（不发送）。控制台的「测试生成」也走这里，保证与 AI 通道同一条链路。
    * 失败时记录 lastError 后原样抛出，让调用方拿到可读原因。
@@ -2056,9 +2109,142 @@ async function main() {
   }
 
 
+  // ── 语音生成（MiniMax T2A v2）──────────────────────────────────────────────
+  //
+  // 链路：文本 → MiniMax /v1/t2a_v2 → mp3 落盘 audio/ → sendVoiceV2 当语音条发出。
+  // 生成与发送复用同一套语音库约束/限流/审计；生成的 mp3 也会留在语音库里，方便重发。
+  let voiceListCache = null;
+
+  /** 拉一次官方系统音色列表并缓存 10 分钟（控制台音色下拉用，不消耗合成额度）。 */
+  async function systemVoiceOptions(vc) {
+    if (!vc.generation.key || vc.generation.keySource === 'none') return [];
+    if (voiceListCache && Date.now() - voiceListCache.at < 10 * 60 * 1000) return voiceListCache.list;
+    try {
+      const list = await fetchSystemVoices({ gen: { baseUrl: vc.generation.baseUrl }, apiKey: vc.generation.key });
+      voiceListCache = { at: Date.now(), list };
+      return list;
+    } catch (error) {
+      log('[voice] 音色列表获取失败（不影响生成）:', error?.message ?? error);
+      return voiceListCache?.list ?? [];
+    }
+  }
+
+  /**
+   * 生成一段语音并落盘（不发送）。控制台的「测试语音」也走这里，保证与 AI 通道同一条链路。
+   * 失败时记录 lastError 后原样抛出，让调用方拿到可读原因。
+   */
+  async function generateVoiceToLibrary({ text, voiceId, emotion, speed, vol, pitch, source = 'agent' } = {}) {
+    const vc = voiceCfg();
+    const started = Date.now();
+    let result;
+    let opts;
+    try {
+      if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
+      if (!vc.generation.enabled) throw new Error('语音生成已关闭（socialV2.voice.generation.enabled=false）');
+      if (!vc.generation.key || vc.generation.keySource === 'none') {
+        const error = new Error('还没有配置 MiniMax API Key：在控制台「二代仿真 → 语音生成」填写，或设置 MINIMAX_API_KEY 环境变量');
+        error.code = 'NO_API_KEY';
+        throw error;
+      }
+      opts = normalizeVoiceOptions({
+        voiceId: voiceId ?? vc.generation.voiceId,
+        emotion: emotion ?? vc.generation.emotion,
+        speed: speed ?? vc.generation.speed,
+        vol: vol ?? vc.generation.vol,
+        pitch: pitch ?? vc.generation.pitch,
+        languageBoost: vc.generation.languageBoost,
+        format: vc.generation.format,
+        sampleRate: vc.generation.sampleRate,
+        bitrate: vc.generation.bitrate,
+        channel: vc.generation.channel,
+        maxChars: vc.generation.maxChars
+      });
+      result = await generateVoice({
+        text,
+        voiceId: opts.voiceId,
+        emotion: opts.emotion,
+        speed: opts.speed,
+        vol: opts.vol,
+        pitch: opts.pitch,
+        languageBoost: opts.languageBoost,
+        format: opts.format,
+        sampleRate: opts.sampleRate,
+        bitrate: opts.bitrate,
+        channel: opts.channel,
+        maxChars: opts.maxChars,
+        gen: {
+          baseUrl: vc.generation.baseUrl,
+          model: vc.generation.model,
+          timeoutMs: vc.generation.timeoutMs
+        },
+        apiKey: vc.generation.key
+      });
+    } catch (error) {
+      commitVoiceStats({
+        failed: voiceStats().failed + 1,
+        lastAt: Date.now(),
+        lastOk: false,
+        lastError: truncateText(String(error?.message ?? error), 300),
+        lastSource: source
+      });
+      throw error;
+    }
+
+    if (result.buffer.length > vc.maxBytes) {
+      throw new Error(`生成的语音太大（${formatBytes(result.buffer.length)}，上限 ${formatBytes(vc.maxBytes)}）`);
+    }
+    const durationSec = result.audioLengthMs ? Math.round(result.audioLengthMs / 100) / 10 : null;
+    if (durationSec && durationSec > vc.maxSeconds) {
+      throw new Error(`生成的语音太长（${durationSec} 秒，上限 ${vc.maxSeconds} 秒）：语音只适合两三句话，请拆短或改用文字`);
+    }
+    const saved = saveVoiceFile(result.buffer, vc.dir, { format: result.format, prefix: 'mm' });
+    commitVoiceStats({
+      generated: voiceStats().generated + 1,
+      lastAt: Date.now(),
+      lastOk: true,
+      lastError: '',
+      lastLatencyMs: result.latencyMs || (Date.now() - started),
+      lastFile: saved.filename,
+      lastSource: source,
+      lastModel: result.model,
+      lastVoiceId: result.voiceId,
+      lastDurationSec: durationSec ?? 0,
+      lastChars: result.usageCharacters ?? 0
+    });
+    return {
+      ...saved,
+      duration: durationSec,
+      latencyMs: result.latencyMs || (Date.now() - started),
+      model: result.model,
+      voiceId: result.voiceId,
+      emotion: result.emotion || '',
+      mimeType: result.mimeType || saved.mimeType,
+      chars: result.usageCharacters ?? null,
+      text: truncateText(String(text ?? ''), 200)
+    };
+  }
+
+  /** 生成 + 直接发到会话（AI 默认语音回复走这里）。 */
+  async function generateAndSendVoiceForV2(key, { text, voiceId, emotion, speed, vol, pitch, replyToMessageId = null, atUserId = null, note = '' } = {}) {
+    const vc = voiceCfg();
+    if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
+    // 先查额度：超限时不要先烧掉一次合成额度再被发送拦下。
+    voiceBudgetCheck(key, vc);
+    const generated = await generateVoiceToLibrary({ text, voiceId, emotion, speed, vol, pitch, source: 'agent' });
+    // 传文件名而不是绝对路径：仍走语音库解析闸门，不因为「刚生成的」就开后门。
+    const sent = await sendVoiceForV2(key, generated.filename, {
+      label: note || '[语音]',
+      replyToMessageId,
+      atUserId
+    });
+    log(`[voice-gen] ${key} 生成并发送语音 ${generated.filename}（${generated.duration ?? '?'} 秒，${generated.latencyMs}ms，voice=${generated.voiceId}，messageId=${sent.messageId ?? '?'}）`);
+    return { generated, sent };
+  }
+
+  // ── 语音发送（把准备好的音频当 QQ 语音条发出） ──────────────────────────────
   // ── 语音发送（把准备好的音频当 QQ 语音条发出） ──────────────────────────────
   //
-  // 链路：本地音频文件 → SnowLuma 的 record 段 → 网关自带 SILK 编码 → QQ 语音条。
+  // 链路：本地音频文件 → base64:// 内联进 SnowLuma 的 record 段 → 网关自带 SILK 编码 → QQ 语音条。
   // 网关侧事实（v1.14.9 源码确认）：record 段的 file 接受本地路径 / file:// / http(s):// / base64://，
   // 非 SILK 的音频由网关的 native ffmpeg addon 自动转成 NT SILK，所以这里不做预转码。
   //
@@ -2085,8 +2271,33 @@ async function main() {
 
   function voiceCfg() {
     const v = cfg.socialV2?.voice ?? {};
+    const g = (v.generation && typeof v.generation === 'object' && !Array.isArray(v.generation)) ? v.generation : {};
+    const keyInfo = readApiKey({ apiKey: g.apiKey, apiKeyEnv: g.apiKeyEnv });
+    // 配置是用户可编辑的：非法参数回退默认值，别让一个手抖的 speed 让整个桥接起不来。
+    let norm;
+    try {
+      norm = normalizeVoiceOptions({
+        voiceId: g.voiceId,
+        emotion: g.emotion,
+        speed: g.speed,
+        vol: g.vol,
+        pitch: g.pitch,
+        languageBoost: g.languageBoost,
+        format: g.format,
+        sampleRate: g.sampleRate,
+        bitrate: g.bitrate,
+        channel: g.channel,
+        maxChars: g.maxChars
+      });
+    } catch {
+      norm = normalizeVoiceOptions({});
+    }
+    let baseUrl = VOICE_GEN_DEFAULTS.baseUrl;
+    try { baseUrl = normalizeBaseUrl(String(g.baseUrl ?? ''), VOICE_GEN_DEFAULTS.baseUrl); } catch {}
+    const timeout = Number(g.timeoutMs);
     return {
       enabled: v.enabled !== false,
+      prefer: v.prefer !== false,
       dir: path.resolve(ROOT, String(v.dir ?? 'audio')),
       maxSeconds: Number(v.maxSeconds) > 0 ? Number(v.maxSeconds) : 300,
       maxBytes: Number(v.maxBytes) > 0 ? Number(v.maxBytes) : 20 * 1024 * 1024,
@@ -2096,7 +2307,20 @@ async function main() {
       defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
       loudness: v.loudness || 'normal',
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
-      autoReadback: v.autoReadback !== false
+      autoReadback: v.autoReadback !== false,
+      generation: {
+        enabled: g.enabled !== false,
+        baseUrl,
+        apiKey: String(g.apiKey ?? '').trim(),
+        apiKeyEnv: String(g.apiKeyEnv || VOICE_GEN_DEFAULTS.apiKeyEnv),
+        key: keyInfo.key,
+        keySource: keyInfo.source,
+        model: /^[A-Za-z0-9._-]{1,64}$/.test(String(g.model ?? '')) ? String(g.model) : VOICE_GEN_DEFAULTS.model,
+        ...norm,
+        timeoutMs: Number.isFinite(timeout) && timeout > 0
+          ? Math.min(300000, Math.max(10000, Math.round(timeout)))
+          : VOICE_GEN_DEFAULTS.timeoutMs
+      }
     };
   }
 
@@ -2259,7 +2483,7 @@ async function main() {
    * audio 可传音量设置 { volume, normalize, loudness }：SnowLuma 的 record 段没有增益字段，
    * 所以音量必须在本地用 ffmpeg 调好再发（临时文件发完即删）。
    */
-  async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null } = {}) {
+  async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null, replyToMessageId = null, atUserId = null } = {}) {
     const assertSendAllowed = guard ? captureSendGuard(key, { ai: true }) : null;
     const vc = voiceCfg();
     // 注意：这里**不检查** vc.enabled —— 那是「AI 能不能发语音」的开关，判定放在
@@ -2289,7 +2513,24 @@ async function main() {
     const sendPath = processed.path;
 
     const [kind, id] = key.split(':');
-    const recordSegment = { type: 'record', data: { file: sendPath } };
+    // 网关可能跑在另一台机器上（本机的 127.0.0.1:3000/3001 只是 SSH 隧道转发），
+    // 本地绝对路径在网关侧不存在 —— 实测 send_private_msg 会报 ENOENT: stat。
+    // 所以语音也走 base64:// 内联（SnowLuma 的 record.file 支持），与图片段同源。
+    const recordSegment = { type: 'record', data: { file: 'base64://' + fs.readFileSync(sendPath).toString('base64') } };
+    // 语音也是一条普通消息：可以 @ 人 / 引用某条消息（段顺序与文本发送一致：at → reply → record）。
+    const messageSegments = [];
+    if (atUserId !== null && atUserId !== undefined && String(atUserId).trim() !== '') {
+      const at = String(atUserId).trim();
+      if (!/^\d{5,20}$/.test(at)) throw new Error('atUserId 必须是 QQ 号（纯数字）');
+      if (kind !== 'group') throw new Error('私聊不能 @ 人（atUserId 只在群聊可用）');
+      messageSegments.push({ type: 'at', data: { qq: at } });
+    }
+    if (replyToMessageId !== null && replyToMessageId !== undefined && String(replyToMessageId).trim() !== '') {
+      const rid = String(replyToMessageId).trim();
+      if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
+      messageSegments.push({ type: 'reply', data: { id: rid } });
+    }
+    messageSegments.push(recordSegment);
     let resolveSend;
     let rejectSend;
     const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
@@ -2303,8 +2544,8 @@ async function main() {
         const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
         const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
         const params = kind === 'private'
-          ? { user_id: Number(id), message: [recordSegment] }
-          : { group_id: Number(id), message: [recordSegment] };
+          ? { user_id: Number(id), message: messageSegments }
+          : { group_id: Number(id), message: messageSegments };
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -2414,16 +2655,18 @@ async function main() {
    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
    * 返回 { messageId, detail, verified, readback }。
    */
-  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null } = {}) {
+  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null, guard = true, replyToMessageId = null, atUserId = null } = {}) {
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
     const resolved = resolveVoicePathForV2(voiceRef);
     // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
     if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
     voiceBudgetCheck(key, vc);
-    const sent = await sendVoiceV2(key, resolved.path, { guard: true, audit: true, audio });
+    const sent = await sendVoiceV2(key, resolved.path, { guard, audit: true, audio, replyToMessageId, atUserId });
     voiceBudgetCommit(key);
     recordVoiceSentV2(key, sent, label);
+    // 语音发送计数（与生成计数分开：生成成功但发送失败时 sent 不应增加）。
+    commitVoiceStats({ sent: voiceStats().sent + 1 });
     log(`[voice] ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}, messageId=${sent.messageId ?? '?'})`);
     appendActivity(`${key} [voice] 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
     let readbackText = null;
@@ -4312,7 +4555,8 @@ async function main() {
         const closedAgentMedia = currentMode === 'closed-agent' && [
           '/api/socialV2/sticker-list', '/api/socialV2/sticker-image',
           '/api/socialV2/send-sticker', '/api/socialV2/self-image',
-          '/api/socialV2/send-image', '/api/socialV2/generate-image'
+          '/api/socialV2/send-image', '/api/socialV2/generate-image',
+          '/api/socialV2/generate-voice'
         ].includes(url.pathname);
         if (req.headers['x-agent-token'] === '') {
           sendJson({ ok: false, error: 'agent token 不能为空' }, 403);
@@ -4336,7 +4580,7 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/image/status', '/api/socialV2/image/test'];
+        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/image/status', '/api/socialV2/image/test', '/api/socialV2/voice/status', '/api/socialV2/voice/test'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -5388,6 +5632,14 @@ async function main() {
             gen.apiKeySource = keyInfo.source;
             gen.apiKeyMasked = keyInfo.key ? maskApiKey(keyInfo.key) : '';
           }
+          const vgen = snapshot?.voice?.generation;
+          if (vgen) {
+            const keyInfo = readApiKey({ apiKey: vgen.apiKey, apiKeyEnv: vgen.apiKeyEnv });
+            vgen.apiKey = '';
+            vgen.apiKeyConfigured = Boolean(keyInfo.key);
+            vgen.apiKeySource = keyInfo.source;
+            vgen.apiKeyMasked = keyInfo.key ? maskApiKey(keyInfo.key) : '';
+          }
           sendJson({ ok: true, config: snapshot });
           return;
         }
@@ -5416,20 +5668,77 @@ async function main() {
             }
           }
           // 可执行文件位置只接受本机配置/环境变量，HTTP 配置接口不能更换运行的程序。
+          // voice：语音库上限 / 语音优先偏好 / MiniMax TTS 生成配置归一化。
+          // apiKey 留空 = 保持原值（GET 不回显 Key）；要清空必须显式传 clearApiKey=true。
           if (body.voice && typeof body.voice === 'object' && !Array.isArray(body.voice)) {
             if (Object.prototype.hasOwnProperty.call(body.voice, 'ffmpegPath')) {
               sendJson({ ok: false, error: 'ffmpegPath 只能在本机 config.json 或 FFMPEG_PATH 中配置' }, 400);
               return;
             }
-            const currentVoice = cfg.socialV2?.voice ?? {};
-            merged.voice = { ...currentVoice, ...body.voice, ffmpegPath: currentVoice.ffmpegPath ?? '' };
+            const curVoice = (current.voice && typeof current.voice === 'object' && !Array.isArray(current.voice)) ? current.voice : {};
+            const curGen = (curVoice.generation && typeof curVoice.generation === 'object' && !Array.isArray(curVoice.generation)) ? curVoice.generation : {};
+            const next = { ...curVoice, ...body.voice, ffmpegPath: curVoice.ffmpegPath ?? '' };
+            for (const k of ['enabled', 'prefer', 'allowAbsolutePath', 'autoReadback']) {
+              if (next[k] !== undefined) next[k] = next[k] === true;
+            }
+            const dir = String(next.dir ?? '').trim() || 'audio';
+            next.dir = (!path.isAbsolute(dir) && !dir.split(/[\\/]/).includes('..')) ? dir : (curVoice.dir ?? 'audio');
+            for (const [k, min, max, fallback] of [['maxSeconds', 1, 300, 300], ['maxBytes', 1024 * 1024, 20 * 1024 * 1024, 20 * 1024 * 1024], ['maxPerMinute', 0, 100, 2], ['maxPerHour', 0, 1000, 10]]) {
+              const n = Number(next[k]);
+              next[k] = Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : (Number(curVoice[k]) || fallback);
+            }
+            const vol = Number(next.defaultVolume);
+            next.defaultVolume = Number.isFinite(vol) && vol > 0 ? Math.min(10, Math.max(0.1, vol)) : (Number(curVoice.defaultVolume) || 1);
+            next.loudness = ['normal', 'loud', 'quiet'].includes(String(next.loudness)) ? String(next.loudness) : (curVoice.loudness || 'normal');
+            if (body.voice.generation && typeof body.voice.generation === 'object' && !Array.isArray(body.voice.generation)) {
+              const g = { ...curGen, ...body.voice.generation };
+              const keyInput = typeof g.apiKey === 'string' ? g.apiKey.trim() : '';
+              if (g.clearApiKey === true) g.apiKey = '';
+              else g.apiKey = keyInput || String(curGen.apiKey ?? '');
+              delete g.clearApiKey;
+              if (g.apiKey.length > 4096) { sendJson({ ok: false, error: 'API Key 过长' }, 400); return; }
+              if (g.apiKey && /\s/.test(g.apiKey)) { sendJson({ ok: false, error: 'API Key 不能包含空白字符' }, 400); return; }
+              try {
+                g.baseUrl = normalizeBaseUrl(String(g.baseUrl ?? ''), String(curGen.baseUrl || VOICE_GEN_DEFAULTS.baseUrl));
+              } catch (error) {
+                sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+                return;
+              }
+              g.model = /^[A-Za-z0-9._-]{1,64}$/.test(String(g.model ?? '')) ? String(g.model) : (curGen.model ?? VOICE_GEN_DEFAULTS.model);
+              g.apiKeyEnv = /^[A-Z_][A-Z0-9_]{0,63}$/.test(String(g.apiKeyEnv ?? '')) ? String(g.apiKeyEnv) : (curGen.apiKeyEnv ?? VOICE_GEN_DEFAULTS.apiKeyEnv);
+              try {
+                Object.assign(g, normalizeVoiceOptions({
+                  voiceId: g.voiceId,
+                  emotion: g.emotion,
+                  speed: g.speed,
+                  vol: g.vol,
+                  pitch: g.pitch,
+                  languageBoost: g.languageBoost,
+                  format: g.format,
+                  sampleRate: g.sampleRate,
+                  bitrate: g.bitrate,
+                  channel: g.channel,
+                  maxChars: g.maxChars
+                }));
+              } catch (error) {
+                sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+                return;
+              }
+              const timeout = Number(g.timeoutMs);
+              g.timeoutMs = Number.isFinite(timeout) ? Math.min(300000, Math.max(10000, Math.round(timeout))) : (curGen.timeoutMs ?? VOICE_GEN_DEFAULTS.timeoutMs);
+              g.enabled = g.enabled !== false;
+              next.generation = g;
+            } else {
+              next.generation = { ...curGen };
+            }
+            merged.voice = next;
           }
           if (merged.autoReplyCheckMs !== undefined) {
             const n = Number(merged.autoReplyCheckMs);
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendImage', 'genImage'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendImage', 'genImage', 'genVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -5739,7 +6048,8 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
-            sendVoice: 'qq_send_voice / qq_list_voices'
+            sendVoice: 'qq_send_voice / qq_list_voices',
+            genVoice: 'qq_gen_voice'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -5783,13 +6093,23 @@ async function main() {
               context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8, key) : '',
               strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
             },
-            // 语音库摘要：让 AI 一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。
+            // 语音摘要：语音库 + 生成能力 + 是否语音优先（AI 据此决定用 qq_gen_voice 还是打字）。
             voices: cfg.socialV2?.voice?.enabled === false ? { enabled: false } : {
               enabled: true,
+              prefer: voiceCfg().prefer,
               total: voiceLibrary().length,
               names: voiceLibrary().slice(0, 12).map((v) => v.name),
               maxSeconds: voiceCfg().maxSeconds,
-              hint: '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
+              generation: {
+                enabled: voiceCfg().generation.enabled,
+                keyConfigured: Boolean(voiceCfg().generation.key),
+                voiceId: voiceCfg().generation.voiceId,
+                model: voiceCfg().generation.model,
+                maxChars: voiceCfg().generation.maxChars
+              },
+              hint: voiceCfg().prefer
+                ? '默认用 qq_gen_voice 把要说的两三句话合成语音发出去（语音是单独一条消息，不要再打字重复同一段）；长内容/代码/链接用文字。qq_list_voices + qq_send_voice 可发现成音频'
+                : '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去；qq_gen_voice 可现场合成'
             }
           });
           return;
@@ -6932,6 +7252,203 @@ async function main() {
           return;
         }
 
+        // ── 语音生成（AI 通道）：MiniMax 合成 → 落盘 audio/ → 直接发到会话 ──
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/generate-voice') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const vc = voiceCfg();
+          if (!vc.enabled) { sendJson({ ok: false, error: '语音功能已关闭（socialV2.voice.enabled=false）' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2' && !closedAgentMedia) { sendJson({ ok: false, error: '该接口仅 reserved2 或管理员私聊模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('genVoice')) { sendJson({ ok: false, error: '工具未启用：qq_gen_voice' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          if (!vc.generation.enabled) { sendJson({ ok: false, error: '语音生成已关闭（socialV2.voice.generation.enabled=false）' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          const text = String(body.text ?? '').trim();
+          if (!text) { sendJson({ ok: false, error: 'text 不能为空（把要念出来的话传进来）' }, 400); return; }
+          let voiceOptions;
+          try {
+            voiceOptions = normalizeVoiceOptions({
+              voiceId: body.voiceId,
+              emotion: body.emotion,
+              speed: body.speed,
+              vol: body.vol,
+              pitch: body.pitch,
+              maxChars: vc.generation.maxChars
+            });
+            if (text.length > voiceOptions.maxChars) {
+              throw new Error(`语音文本太长（${text.length} 字，上限 ${voiceOptions.maxChars} 字）：语音只适合两三句话，长内容请打字`);
+            }
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+            return;
+          }
+          const atUserId = body.atUserId === undefined || body.atUserId === null || String(body.atUserId).trim() === ''
+            ? null
+            : String(body.atUserId).trim();
+          if (atUserId && !/^\d{5,20}$/.test(atUserId)) { sendJson({ ok: false, error: 'atUserId 必须是 QQ 号（纯数字）' }, 400); return; }
+          if (atUserId && kind !== 'group') { sendJson({ ok: false, error: '私聊不能 @ 人' }, 400); return; }
+          const replyToMessageId = body.replyToMessageId;
+          let actualReplyToMessageId = replyToMessageId;
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+            if (!/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
+              sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
+              return;
+            }
+            const stForReply = getSocialV2State(key);
+            const resolved = await resolveReplyTargetV2(stForReply, kind, id, String(replyToMessageId).trim());
+            if (!resolved) {
+              sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话' }, 400);
+              return;
+            }
+            actualReplyToMessageId = resolved.messageId;
+          }
+          try {
+            const { generated, sent } = await generateAndSendVoiceForV2(key, {
+              text,
+              voiceId: voiceOptions.voiceId,
+              emotion: voiceOptions.emotion,
+              speed: voiceOptions.speed,
+              vol: voiceOptions.vol,
+              pitch: voiceOptions.pitch,
+              replyToMessageId: actualReplyToMessageId,
+              atUserId,
+              note: String(body.label ?? '').trim()
+            });
+            sendJson({
+              ok: true,
+              key,
+              messageId: sent.messageId,
+              filename: generated.filename,
+              bytes: generated.bytes,
+              duration: generated.duration,
+              format: generated.format,
+              voiceId: generated.voiceId,
+              model: generated.model,
+              latencyMs: generated.latencyMs,
+              verified: sent.verification?.confirmed === true,
+              detail: sent.detail
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, error?.code === 'NO_API_KEY' ? 503 : 500);
+          }
+          return;
+        }
+
+        // ── 语音状态（控制台）：Key 是否配置、模型/音色、上次生成结果、语音库 ──
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/voice/status') {
+          const vc = voiceCfg();
+          const voices = await systemVoiceOptions(vc);
+          sendJson({
+            ok: true,
+            enabled: vc.enabled,
+            prefer: vc.prefer,
+            dir: path.basename(vc.dir),
+            maxSeconds: vc.maxSeconds,
+            maxBytes: vc.maxBytes,
+            maxPerMinute: vc.maxPerMinute,
+            maxPerHour: vc.maxPerHour,
+            allowAbsolutePath: vc.allowAbsolutePath,
+            defaultVolume: vc.defaultVolume,
+            generation: {
+              enabled: vc.generation.enabled,
+              baseUrl: vc.generation.baseUrl,
+              model: vc.generation.model,
+              voiceId: vc.generation.voiceId,
+              emotion: vc.generation.emotion,
+              speed: vc.generation.speed,
+              vol: vc.generation.vol,
+              pitch: vc.generation.pitch,
+              languageBoost: vc.generation.languageBoost,
+              format: vc.generation.format,
+              sampleRate: vc.generation.sampleRate,
+              bitrate: vc.generation.bitrate,
+              channel: vc.generation.channel,
+              maxChars: vc.generation.maxChars,
+              timeoutMs: vc.generation.timeoutMs,
+              keyConfigured: Boolean(vc.generation.key),
+              keySource: vc.generation.keySource,
+              keyMasked: vc.generation.key ? maskApiKey(vc.generation.key) : ''
+            },
+            stats: voiceStats(),
+            latest: listVoiceFiles(vc.dir, { limit: 8 }),
+            voices
+          });
+          return;
+        }
+
+        // ── 测试语音（控制台，会消耗一次 MiniMax 额度；可返回音频试听/顺带发送）──
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/voice/test') {
+          const body = await readBody();
+          const vc = voiceCfg();
+          if (!vc.enabled) { sendJson({ ok: false, error: '语音功能已关闭' }, 403); return; }
+          if (!vc.generation.enabled) { sendJson({ ok: false, error: '语音生成已关闭（socialV2.voice.generation.enabled=false）' }, 403); return; }
+          const sendTo = String(body.sendTo ?? '').trim();
+          if (sendTo) {
+            const target = parseTargetKey(sendTo);
+            if (!target || !modeAllowed(sendTo, target.kind, Number(target.id), cfg, currentMode)) {
+              sendJson({ ok: false, error: '发送目标不在白名单内（config.json allow.groups / allow.private）' }, 403);
+              return;
+            }
+          }
+          try {
+            const text = String(body.text ?? '').trim() || VOICE_PREVIEW_TEXT;
+            const voiceOptions = normalizeVoiceOptions({
+              voiceId: body.voiceId ?? vc.generation.voiceId,
+              emotion: body.emotion ?? vc.generation.emotion,
+              speed: body.speed ?? vc.generation.speed,
+              vol: body.vol ?? vc.generation.vol,
+              pitch: body.pitch ?? vc.generation.pitch,
+              maxChars: vc.generation.maxChars
+            });
+            const generated = await generateVoiceToLibrary({
+              text,
+              voiceId: voiceOptions.voiceId,
+              emotion: voiceOptions.emotion,
+              speed: voiceOptions.speed,
+              vol: voiceOptions.vol,
+              pitch: voiceOptions.pitch,
+              source: 'console-test'
+            });
+            let sent = null;
+            if (sendTo) {
+              sent = await sendVoiceForV2(sendTo, generated.filename, { label: '[测试语音]', guard: false });
+            }
+            // 控制台试听：直接把音频以 base64 带回去（≤2MB，超了只给元数据）。
+            const audioBase64 = generated.bytes <= 2 * 1024 * 1024
+              ? fs.readFileSync(generated.path).toString('base64')
+              : '';
+            sendJson({
+              ok: true,
+              filename: generated.filename,
+              bytes: generated.bytes,
+              duration: generated.duration,
+              format: generated.format,
+              voiceId: generated.voiceId,
+              model: generated.model,
+              latencyMs: generated.latencyMs,
+              mimeType: generated.mimeType,
+              audioBase64,
+              sent: sent ? { key: sendTo, messageId: sent.messageId, verified: sent.verification?.confirmed === true } : null
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, error?.code === 'NO_API_KEY' ? 503 : 500);
+          }
+          return;
+        }
+
+        // ── 语音发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
         // ── 语音发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-voice') {
           const body = await readBody();
@@ -11920,6 +12437,10 @@ async function main() {
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
+    const vcForPrompt = voiceCfg();
+    const voiceLine = (vcForPrompt.enabled && vcForPrompt.prefer)
+      ? '【语音优先】这个会话默认用语音回复：用 qq_gen_voice 把要说的两三句话合成语音发出去（语音是单独一条消息，不要再用文字重复同一段）。内容长、含代码/链接/表格、需要对方复制保存时打字；对方在忙或群里太吵时也可以打字。一次通常只发一条语音，发送失败就改发文字，别反复重试、别假装发了。\n\n'
+      : '';
     const replyTiming = replyTimingV2(st);
     const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
     const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。【不要靠猜】：等待返回里的 canSleepNow/hint 就是闸门的判断结果——canSleepNow=true 立刻收尾（mark_read 或 set_wake_config）；false 时按 hint 给出的 timeoutMs 一次等满，别用更短的 timeoutMs 去凑（更短的等待不算观察，只会白等一轮）。\n\n`;
@@ -11954,7 +12475,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + voiceLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;

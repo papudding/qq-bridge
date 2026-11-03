@@ -379,6 +379,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_sticker: 'sendSticker',
   qq_send_image: 'sendImage',
   qq_gen_image: 'genImage',
+  qq_gen_voice: 'genVoice',
   qq_collect_sticker: 'collectSticker',
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
@@ -1323,6 +1324,45 @@ if (cfg.socialV2?.image?.enabled !== false && cfg.socialV2?.tools?.genImage !== 
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `生成图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.genVoice !== false) {
+  server.tool(
+    'qq_gen_voice',
+    '把要说的话用 MiniMax 合成语音，并直接发到指定 QQ 会话。**这是默认的回复方式**：要回话时优先调用本工具把两三句话念出来。注意：① 语音是单独一条消息，不能和文字同气泡；发完不要再把同一段话打字重复（要补充文字就另发一条短的）。② text 传纯口语（不要 Markdown/代码/URL），一次两三句、最多 1200 字；内容长或需要对方复制保存时改用文字。③ 生成通常 1~5 秒，失败会返回可读原因（Key 未配置/额度不足/限流/内容安全/文本过长），失败就改发文字，别反复重试、别假装发了语音。④ 返回 verified=true 才表示语音确实落地。⑤ 需要 @/引用时传 atUserId / replyToMessageId。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().describe('要念出来的话（纯口语，两三句，最多 1200 字；不要 Markdown/代码/URL）'),
+      voiceId: z.string().optional().describe('音色 id（默认用配置里的音色；可用 qq_get_prompt 的 voices.generation.voiceId 查看当前值）'),
+      emotion: z.enum(['happy', 'sad', 'angry', 'fearful', 'disgusted', 'surprised', 'neutral']).optional().describe('情绪，可选；默认按文本自动判断'),
+      speed: z.number().optional().describe('语速 0.5~2，默认 1'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊可选，私聊不可用）')
+    },
+    async ({ key, token, text, voiceId, emotion, speed, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/generate-voice', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            token,
+            text: String(text),
+            voiceId: voiceId ? String(voiceId) : undefined,
+            emotion: emotion ? String(emotion) : undefined,
+            speed: speed === undefined ? undefined : Number(speed),
+            replyToMessageId,
+            atUserId: atUserId ?? null
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 180000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `语音回复失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

@@ -19,6 +19,7 @@ QQ ↔ SnowLuma ↔ qq-bridge ↔ DeepSeek Harness ↔ 模型服务
 | --- | --- |
 | 消息桥接 | 按群聊 / 私聊维护独立会话，支持文本、图片、表情与引用回复 |
 | 图片生成 | 接入 MiniMax 文生图（`qq_gen_image`），生成后直接发到会话；也可用 `qq_send_image` 发图片库文件或 http(s) 图片。Key 在控制台「图片生成」面板填写，不回显 |
+| 语音生成 | 接入 MiniMax 语音合成（`qq_gen_voice`），把要回的话直接念出来发成 QQ 语音条；`qq_send_voice` 可发语音库现成音频。控制台「语音生成」面板填 Key/选音色，打开「语音优先」后 AI 默认用语音回话 |
 | 聊天与仿真 | 普通聊天（`chat`）、两代群友仿真（`reserved` / `reserved2`）、自定义角色 |
 | 个人助手 | `closed-agent` 仅限管理员私聊，可使用完整 DSH 工具；请谨慎开启 |
 | 本地管理 | 控制台切换模式、管理白名单与审批、查看日志和模型用量 |

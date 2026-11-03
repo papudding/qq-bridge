@@ -153,7 +153,8 @@
       "getSelfImage": true,
       "sendVoice": false,
       "sendImage": true,
-      "genImage": true
+      "genImage": true,
+      "genVoice": true
     },
     "wake": {
       "defaultMode": "diving",
@@ -234,6 +235,7 @@
     },
     "voice": {
       "enabled": false,
+      "prefer": true,
       "dir": "audio",
       "maxSeconds": 300,
       "maxBytes": 20971520,
@@ -243,7 +245,26 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true
+      "autoReadback": true,
+      "generation": {
+        "enabled": true,
+        "baseUrl": "https://api.minimax.cn",
+        "apiKey": "",
+        "apiKeyEnv": "MINIMAX_API_KEY",
+        "model": "speech-2.8-hd",
+        "voiceId": "female-shaonv",
+        "emotion": "",
+        "speed": 1,
+        "vol": 1,
+        "pitch": 0,
+        "languageBoost": "auto",
+        "format": "mp3",
+        "sampleRate": 32000,
+        "bitrate": 128000,
+        "channel": 1,
+        "timeoutMs": 120000,
+        "maxChars": 1200
+      }
     },
     "image": {
       "enabled": true,
