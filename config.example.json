@@ -149,7 +149,9 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendVoice": false,
+      "sendImage": true,
+      "genImage": true
     },
     "wake": {
       "defaultMode": "diving",
@@ -240,6 +242,24 @@
       "loudness": "normal",
       "ffmpegPath": "",
       "autoReadback": true
+    },
+    "image": {
+      "enabled": true,
+      "dir": "images",
+      "allowAbsolutePath": false,
+      "maxBytes": 8388608,
+      "maxPerMinute": 3,
+      "maxPerHour": 30,
+      "generation": {
+        "enabled": true,
+        "baseUrl": "https://api.minimax.cn",
+        "apiKey": "",
+        "apiKeyEnv": "MINIMAX_API_KEY",
+        "model": "image-01",
+        "aspectRatio": "1:1",
+        "promptOptimizer": true,
+        "timeoutMs": 180000
+      }
     },
     "proactive": {
       "enabled": true,

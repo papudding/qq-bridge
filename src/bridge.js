@@ -25,7 +25,18 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge, sanitizeUntrustedText } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
-import { normalizeImageForModel } from './media-normalize.js';
+import { normalizeImageForModel, sniffImage } from './media-normalize.js';
+import {
+  IMAGE_GEN_DEFAULTS,
+  bufferToImage,
+  generateImage,
+  listImageFiles,
+  maskApiKey,
+  normalizeAspectRatio,
+  normalizeBaseUrl,
+  readApiKey,
+  saveImageFile
+} from './image-gen.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -69,6 +80,8 @@ const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
 const SLANG_FILE = path.join(STATE_DIR, 'slang.json');
 const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
 const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
+// 图片生成/发送的累计状态（只存计数与最后一次结果，不存 prompt 原文）。
+const IMAGE_STATS_FILE = path.join(STATE_DIR, 'image-stats.json');
 // 操作者为每个会话预写的「初始提示词」（见 main() 里的 initialPrompts）。
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
@@ -828,7 +841,9 @@ function loadConfig() {
         setStickerRemark: false,
         stickerNote: true,
         collectSticker: true,
-        getSelfImage: true
+        getSelfImage: true,
+        sendImage: true,
+        genImage: true
       },
       wake: {
         defaultMode: 'diving',
@@ -955,6 +970,8 @@ function loadConfig() {
     collectSticker: true,
     getSelfImage: true,
     sendVoice: false,
+    sendImage: true,
+    genImage: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -980,6 +997,33 @@ function loadConfig() {
     ffmpegPath: '',
     autoReadback: true,
     ...(cfg.socialV2?.voice ?? {})
+  };
+
+  // socialV2.image：图片发送 + MiniMax 文生图。
+  //
+  // 与语音不同，图片**默认开启**：发图是 QQ 聊天里的常规表达，不需要用户先准备素材库；
+  // 生成能力也默认注册（工具开关 genImage=true），只是没填 Key 时调用会得到一条
+  // 可读的「去控制台填 Key」错误，而不是让工具从模型清单里消失（否则填完 Key 还得重启 DSH）。
+  //
+  // dir 是**图片库**（相对仓库根目录）：AI 的 qq_send_image 默认只能从这里取文件，
+  // 绝对路径要显式开 allowAbsolutePath（默认关，避免 prompt injection 把本机文件当图外发）。
+  const rawImageCfg = (cfg.socialV2?.image && typeof cfg.socialV2.image === 'object' && !Array.isArray(cfg.socialV2.image))
+    ? cfg.socialV2.image
+    : {};
+  cfg.socialV2.image = {
+    enabled: true,
+    dir: 'images',
+    allowAbsolutePath: false,
+    maxBytes: 8 * 1024 * 1024,
+    maxPerMinute: 3,
+    maxPerHour: 30,
+    ...rawImageCfg,
+    generation: {
+      ...IMAGE_GEN_DEFAULTS,
+      ...((rawImageCfg.generation && typeof rawImageCfg.generation === 'object' && !Array.isArray(rawImageCfg.generation))
+        ? rawImageCfg.generation
+        : {})
+    }
   };
 
   // socialV2.sticker.collect 也需要深度合并，避免旧配置缺失 collect 子项时丢默认值。
@@ -1615,6 +1659,373 @@ async function main() {
     }
     return entry;
   }
+
+  // ── 图片发送与文生图（MiniMax） ────────────────────────────────────────────
+  //
+  // 三条来源最终都收敛成同一个 image 段（base64）交给 SnowLuma：
+  //   ① 图片库（images/）里的现成文件 —— qq_send_image 的 image 参数；
+  //   ② http(s) 图片地址 —— 桥接内用 safeFetchBuffer 下载（SSRF 防护），不让网关重新抓；
+  //   ③ MiniMax 现场生成 —— 先落盘到 images/，再走 ①，于是同一个图片库也能重发。
+  //
+  // 发送与表情包共用 sendChain：文本/表情/图片的相对顺序不会因并发工具调用被打乱。
+  const imageSendTimes = new Map();
+
+  function imageCfg() {
+    const v = cfg.socialV2?.image ?? {};
+    const g = v.generation ?? {};
+    const keyInfo = readApiKey({ apiKey: g.apiKey, apiKeyEnv: g.apiKeyEnv });
+    return {
+      enabled: v.enabled !== false,
+      dir: path.resolve(ROOT, String(v.dir ?? 'images')),
+      allowAbsolutePath: v.allowAbsolutePath === true,
+      maxBytes: Number(v.maxBytes) > 0 ? Number(v.maxBytes) : 8 * 1024 * 1024,
+      maxPerMinute: Number(v.maxPerMinute) >= 0 ? Number(v.maxPerMinute) : 3,
+      maxPerHour: Number(v.maxPerHour) >= 0 ? Number(v.maxPerHour) : 30,
+      generation: {
+        enabled: g.enabled !== false,
+        baseUrl: String(g.baseUrl || IMAGE_GEN_DEFAULTS.baseUrl).replace(/\/+$/, ''),
+        apiKey: String(g.apiKey ?? '').trim(),
+        apiKeyEnv: String(g.apiKeyEnv || IMAGE_GEN_DEFAULTS.apiKeyEnv),
+        key: keyInfo.key,
+        keySource: keyInfo.source,
+        model: String(g.model || IMAGE_GEN_DEFAULTS.model),
+        aspectRatio: String(g.aspectRatio || IMAGE_GEN_DEFAULTS.aspectRatio),
+        promptOptimizer: g.promptOptimizer !== false,
+        timeoutMs: Number(g.timeoutMs) > 0 ? Number(g.timeoutMs) : IMAGE_GEN_DEFAULTS.timeoutMs
+      }
+    };
+  }
+
+  /** 图片发送限流：独立于文本/语音，避免画图把聊天额度吃光，也避免聊天把图片额度耗光。 */
+  function imageBudgetCheck(scopeKey, ic) {
+    const now = Date.now();
+    const bucket = imageSendTimes.get(scopeKey) ?? [];
+    const inMinute = bucket.filter((t) => now - t < 60000);
+    const inHour = bucket.filter((t) => now - t < 3600000);
+    if (ic.maxPerMinute > 0 && inMinute.length + 1 > ic.maxPerMinute) {
+      throw new Error(`图片发送频率超限（每分钟最多 ${ic.maxPerMinute} 张），请稍后再试`);
+    }
+    if (ic.maxPerHour > 0 && inHour.length + 1 > ic.maxPerHour) {
+      throw new Error(`图片发送频率超限（每小时最多 ${ic.maxPerHour} 张），请稍后再试`);
+    }
+  }
+
+  function imageBudgetCommit(scopeKey, at = Date.now()) {
+    const bucket = (imageSendTimes.get(scopeKey) ?? []).filter((t) => at - t < 3600000);
+    bucket.push(at);
+    imageSendTimes.set(scopeKey, bucket);
+  }
+
+  function imagePathInsideLibrary(ic, absPath) {
+    const rel = path.relative(ic.dir, absPath);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    try {
+      if (!fs.statSync(absPath).isFile()) return null;
+    } catch {
+      return null;
+    }
+    return path.join(ic.dir, rel);
+  }
+
+  function resolveImageFileInLibrary(ic, raw) {
+    const joined = safeJoinLibrary(ic.dir, raw);
+    if (joined && fs.existsSync(joined) && fs.statSync(joined).isFile()) {
+      return { kind: 'file', path: joined, via: 'image-dir-safe' };
+    }
+    // 允许省略扩展名：补常见图片扩展名再试一次（仍然不越出图片库）
+    if (!path.extname(raw)) {
+      for (const ext of ['.jpg', '.jpeg', '.png', '.webp', '.gif']) {
+        const cand = safeJoinLibrary(ic.dir, `${raw}${ext}`);
+        if (cand && fs.existsSync(cand) && fs.statSync(cand).isFile()) {
+          return { kind: 'file', path: cand, via: 'image-dir-safe+ext' };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 解析图片引用。安全口径与语音一致：
+   *   - 相对路径**只能**落在图片库内（safeJoinLibrary 会挡 `..` 与 symlink 逃逸）；
+   *   - 绝对路径/file:// 必须显式开 allowAbsolutePath；
+   *   - 不接受 data:/base64:// 内联（那等于把任意字节塞进图片段，绕过图片库与频控的意义）。
+   */
+  function resolveImageSource(input) {
+    const ic = imageCfg();
+    const raw = String(input ?? '').trim();
+    if (!raw) throw new Error('缺少图片：传图片库（images/）里的文件名，或 http(s) 图片地址');
+    if (/^(data:|base64:\/\/)/i.test(raw)) {
+      throw new Error('不接受内联 base64/data 图片；请传图片库文件名或 http(s) 图片地址');
+    }
+    if (/^https?:\/\//i.test(raw)) return { kind: 'url', url: raw };
+    if (/^file:\/\//i.test(raw)) {
+      const abs = fileURLToPath(raw);
+      if (!ic.allowAbsolutePath) {
+        throw new Error(`只能发图片库（${path.basename(ic.dir)}/）里的图片；要发库外文件请让管理员在控制台打开 allowAbsolutePath`);
+      }
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error('file:// 指向的文件不存在');
+      return { kind: 'file', path: abs, via: 'file-url' };
+    }
+    if (path.isAbsolute(raw) || raw.startsWith('~')) {
+      if (!ic.allowAbsolutePath) {
+        throw new Error(`只能发图片库（${path.basename(ic.dir)}/）里的图片；要发库外文件请让管理员在控制台打开 allowAbsolutePath`);
+      }
+      const abs = raw.startsWith('~')
+        ? path.join(os.homedir(), raw.replace(/^~[\\/]?/, ''))
+        : path.resolve(raw);
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error('图片文件不存在');
+      return { kind: 'file', path: abs, via: 'absolute' };
+    }
+    const found = resolveImageFileInLibrary(ic, raw);
+    if (found) return found;
+
+    // 找不到时只报**库内**文件名，绝不回显库外路径（防止路径信息经 MCP 错误进模型上下文）。
+    const library = listImageFiles(ic.dir);
+    const hint = library.length
+      ? `图片库里现有：${library.slice(-12).join('、')}${library.length > 12 ? ` 等 ${library.length} 个` : ''}`
+      : `图片库（${path.basename(ic.dir)}/）目前是空的；也可以直接传 http(s) 图片地址，或用 qq_gen_image 现场生成`;
+    const looksLikeEscape = /(^|[\\/])\.\.([\\/]|$)/.test(raw);
+    if (looksLikeEscape) throw new Error('图片只能从图片库取：路径里出现了「..」，已拒绝（防止读到库外的本机文件）');
+    throw new Error(`图片库里找不到「${raw}」。${hint}`);
+  }
+
+  async function loadImageBuffer(source, ic) {
+    if (Buffer.isBuffer(source)) return { buffer: source, origin: 'generated' };
+    const resolved = resolveImageSource(source);
+    if (resolved.kind === 'url') {
+      const fetched = await safeFetchBuffer(resolved.url, ic.maxBytes, { allowPorts: MEDIA_FETCH_ALLOW_PORTS });
+      return { buffer: fetched.buffer, origin: `url:${safeHostLabel(resolved.url)}` };
+    }
+    const stat = fs.statSync(resolved.path);
+    if (stat.size > ic.maxBytes) {
+      throw new Error(`图片太大（${formatBytes(stat.size)}，上限 ${formatBytes(ic.maxBytes)}），先压缩再发`);
+    }
+    return { buffer: fs.readFileSync(resolved.path), origin: path.basename(resolved.path) };
+  }
+
+  /** 只取 host：URL 的 path/query 可能带签名 token，不该出现在日志或模型上下文里。 */
+  function safeHostLabel(urlString) {
+    try { return new URL(urlString).host; } catch { return 'url'; }
+  }
+
+  /**
+   * 底层发送：把一张图作为 image 段交给 SnowLuma。
+   * guard=true（AI 通道）时，发送前必须通过 captureSendGuard —— 会话/模式/白名单任一变就放弃。
+   */
+  async function sendImageForV2(key, source, { replyToMessageId, atUserId, note = '', guard = true, audit = true, record = true } = {}) {
+    const ic = imageCfg();
+    const { buffer, origin } = await loadImageBuffer(source, ic);
+    if (buffer.length > ic.maxBytes) {
+      throw new Error(`图片太大（${formatBytes(buffer.length)}，上限 ${formatBytes(ic.maxBytes)}）`);
+    }
+    const img = bufferToImage(buffer);
+    if (audit) {
+      const hasKnownToken = hasKnownTokenFragment(origin);
+      if (shouldAuditKey(key) && (SENSITIVE_RE.test(origin) || hasKnownToken)) {
+        log(`⚠️ 图片发送被安全策略拦截 (${key})：${hasKnownToken ? '文件名/地址含会话令牌' : '文件名/地址疑似含敏感信息'}`);
+        appendActivity(`${key} [image] 发送被拦截（${hasKnownToken ? '含会话令牌' : '疑似敏感信息'}）`);
+        throw new Error('图片文件名或地址疑似包含敏感信息（路径/凭据/会话令牌），已阻止发送；请重命名后再发');
+      }
+    }
+
+    const assertSendAllowed = guard ? captureSendGuard(key, { ai: true, explicitAllow: true }) : null;
+    const [kind, id] = key.split(':');
+    const segments = [];
+    if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+      segments.push({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
+    }
+    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+      segments.push({ type: 'at', data: { qq: String(atUserId).trim() } });
+    }
+    segments.push({ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } });
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+    const params = kind === 'private'
+      ? { user_id: Number(id), message: segments }
+      : { group_id: Number(id), message: segments };
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+
+    let resolveSend;
+    let rejectSend;
+    const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
+    let sendChain = sendChainFor(key).then(async () => {
+      try {
+        if (assertSendAllowed) assertSendAllowed();
+        const res = await fetch(`${httpUrl}/${action}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+          },
+          body: JSON.stringify(params),
+          // 图片比文本大：给 60 秒（网关要下载/转码后再上传到 QQ 图床）。
+          signal: AbortSignal.timeout(60000)
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+          const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json）' : '';
+          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+        }
+        resolveSend(body.data);
+      } catch (error) {
+        rejectSend(error);
+      }
+    });
+    rememberSendChain(key, sendChain);
+    const data = await sendPromise;
+    const sent = {
+      messageId: data?.message_id ?? null,
+      bytes: buffer.length,
+      width: img.width,
+      height: img.height,
+      format: img.format,
+      origin
+    };
+    if (record) recordImageSentV2(key, sent, note);
+    appendActivity(`${key} [image] 发送图片 ${origin}（${img.width}×${img.height}，${formatBytes(buffer.length)}）`);
+    return sent;  }
+
+  /** 把「我发了张图」写进二代会话的 recentMessages，让 AI 知道自己刚发过什么。 */
+  function recordImageSentV2(key, sent, note) {
+    const st = getSocialV2State(key);
+    const display = note || `[图片 ${sent.width}×${sent.height}]`;
+    const entry = {
+      messageId: sent.messageId ? String(sent.messageId) : null,
+      sender: '我',
+      text: truncateText(display, 200),
+      plain: truncateText(display, 200),
+      quoteTargetIsSelf: false,
+      isOwner: false,
+      ownerLabel: '',
+      isSelf: true,
+      media: [],
+      hasMedia: false,
+      forwardIds: [],
+      hasForward: false,
+      at: Date.now()
+    };
+    st.recentMessages.push(entry);
+    if (st.recentMessages.length > 200) st.recentMessages = st.recentMessages.slice(-200);
+    st.lastAiReplyAt = entry.at;
+    st.lastActionAt = entry.at;
+    st.wakeConfig.noActionCount = 0;
+    saveSocialV2State();
+  }
+
+  // 图片生成状态：只记计数与最后一次结果（不存 prompt 原文，避免把群聊内容写进状态文件）。
+  let imageStatsCache = null;
+  function imageStats() {
+    if (imageStatsCache) return imageStatsCache;
+    let raw = {};
+    try { raw = JSON.parse(fs.readFileSync(IMAGE_STATS_FILE, 'utf8')) ?? {}; } catch {}
+    imageStatsCache = {
+      generated: Number(raw.generated) || 0,
+      failed: Number(raw.failed) || 0,
+      lastAt: Number(raw.lastAt) || 0,
+      lastOk: raw.lastOk === true,
+      lastError: typeof raw.lastError === 'string' ? raw.lastError : '',
+      lastLatencyMs: Number(raw.lastLatencyMs) || 0,
+      lastFile: typeof raw.lastFile === 'string' ? raw.lastFile : '',
+      lastSource: typeof raw.lastSource === 'string' ? raw.lastSource : '',
+      lastModel: typeof raw.lastModel === 'string' ? raw.lastModel : ''
+    };
+    return imageStatsCache;
+  }
+
+  function commitImageStats(patch) {
+    const st = imageStats();
+    Object.assign(st, patch);
+    try { atomicWriteJson(IMAGE_STATS_FILE, st); } catch (error) { log('保存图片统计失败:', error?.message ?? error); }
+    return st;
+  }
+
+  /**
+   * 生成一张图并落盘（不发送）。控制台的「测试生成」也走这里，保证与 AI 通道同一条链路。
+   * 失败时记录 lastError 后原样抛出，让调用方拿到可读原因。
+   */
+  async function generateImageToLibrary({ prompt, aspectRatio, source = 'agent' } = {}) {
+    const ic = imageCfg();
+    const started = Date.now();
+    let result;
+    try {
+      if (!ic.generation.enabled) throw new Error('图片生成已关闭（socialV2.image.generation.enabled=false）');
+      if (!ic.generation.key || ic.generation.keySource === 'none') {
+        const error = new Error('还没有配置 MiniMax API Key：在控制台「二代仿真 → 图片生成」填写，或设置 MINIMAX_API_KEY 环境变量');
+        error.code = 'NO_API_KEY';
+        throw error;
+      }
+      result = await generateImage({
+        prompt,
+        aspectRatio: aspectRatio ?? ic.generation.aspectRatio,
+        gen: {
+          baseUrl: ic.generation.baseUrl,
+          model: ic.generation.model,
+          promptOptimizer: ic.generation.promptOptimizer,
+          timeoutMs: ic.generation.timeoutMs
+        },
+        apiKey: ic.generation.key
+      });
+    } catch (error) {
+      commitImageStats({
+        failed: imageStats().failed + 1,
+        lastAt: Date.now(),
+        lastOk: false,
+        lastError: truncateText(String(error?.message ?? error), 300),
+        lastSource: source
+      });
+      throw error;
+    }
+
+    // 正常情况下 response_format=base64，直接有图；万一服务端只回 URL，就自己安全下载。
+    let image = result.images[0];
+    if (!image && result.urls.length) {
+      const fetched = await safeFetchBuffer(result.urls[0], ic.maxBytes);
+      image = bufferToImage(fetched.buffer);
+    }
+    if (!image) throw new Error('MiniMax 没有返回可用的图片');
+    if (image.buffer.length > ic.maxBytes) {
+      throw new Error(`生成的图片太大（${formatBytes(image.buffer.length)}，上限 ${formatBytes(ic.maxBytes)}）`);
+    }
+    const saved = saveImageFile(image.buffer, ic.dir, { format: image.format, prefix: 'mm' });
+    commitImageStats({
+      generated: imageStats().generated + 1,
+      lastAt: Date.now(),
+      lastOk: true,
+      lastError: '',
+      lastLatencyMs: result.latencyMs || (Date.now() - started),
+      lastFile: saved.filename,
+      lastSource: source,
+      lastModel: result.model
+    });
+    return {
+      ...saved,
+      width: image.width,
+      height: image.height,
+      mimeType: image.mimeType,
+      latencyMs: result.latencyMs || (Date.now() - started),
+      aspectRatio: result.aspectRatio,
+      model: result.model,
+      prompt: String(prompt ?? '').slice(0, 300)
+    };
+  }
+
+  /** 生成 + 直接发到会话。 */
+  async function generateAndSendImageForV2(key, { prompt, aspectRatio, replyToMessageId, atUserId, note = '' } = {}) {
+    const ic = imageCfg();
+    if (!ic.enabled) throw new Error('图片功能已关闭（socialV2.image.enabled=false）');
+    imageBudgetCheck(key, ic);
+    const generated = await generateImageToLibrary({ prompt, aspectRatio, source: 'agent' });
+    // 传文件名而不是绝对路径：图片库解析仍走同一套 safeJoinLibrary，不因为「这是刚生成的」
+    // 就开一条绕过图片库闸门的内部通道。
+    const sent = await sendImageForV2(key, generated.filename, {
+      replyToMessageId,
+      atUserId,
+      note: note || '[我画的图]'
+    });
+    imageBudgetCommit(key);
+    log(`[image] ${key} 生成并发送图片 ${generated.filename}（${generated.width}×${generated.height}，${generated.latencyMs}ms，messageId=${sent.messageId ?? '?'}）`);
+    return { generated, sent };
+  }
+
 
   // ── 语音发送（把准备好的音频当 QQ 语音条发出） ──────────────────────────────
   //
@@ -3848,7 +4259,8 @@ async function main() {
         // 空 agent token 一律拒绝，防止 MCP 传入空字符串时被当作“管理端/无 token”绕过校验
         const closedAgentMedia = currentMode === 'closed-agent' && [
           '/api/socialV2/sticker-list', '/api/socialV2/sticker-image',
-          '/api/socialV2/send-sticker', '/api/socialV2/self-image'
+          '/api/socialV2/send-sticker', '/api/socialV2/self-image',
+          '/api/socialV2/send-image', '/api/socialV2/generate-image'
         ].includes(url.pathname);
         if (req.headers['x-agent-token'] === '') {
           sendJson({ ok: false, error: 'agent token 不能为空' }, 403);
@@ -3872,7 +4284,7 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt'];
+        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/image/status', '/api/socialV2/image/test'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -4912,7 +5324,19 @@ async function main() {
         }
         // ── 二代仿真模式（reserved2）内部 Agent API ─────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/config') {
-          sendJson({ ok: true, config: cfg.socialV2 ?? {} });
+          // API Key 不回显：控制台只需要知道「已配置/未配置 + 来源」，保存时留空代表保持不变。
+          // 否则 Key 会出现在控制台 DOM、截图和前端日志里，等于多了一个泄露面。
+          let snapshot;
+          try { snapshot = JSON.parse(JSON.stringify(cfg.socialV2 ?? {})); } catch { snapshot = { ...(cfg.socialV2 ?? {}) }; }
+          const gen = snapshot?.image?.generation;
+          if (gen) {
+            const keyInfo = readApiKey({ apiKey: gen.apiKey, apiKeyEnv: gen.apiKeyEnv });
+            gen.apiKey = '';
+            gen.apiKeyConfigured = Boolean(keyInfo.key);
+            gen.apiKeySource = keyInfo.source;
+            gen.apiKeyMasked = keyInfo.key ? maskApiKey(keyInfo.key) : '';
+          }
+          sendJson({ ok: true, config: snapshot });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/config') {
@@ -4934,7 +5358,7 @@ async function main() {
           const current = fileV2 ?? ((cfg.socialV2 && typeof cfg.socialV2 === 'object') ? cfg.socialV2 : {});
           const merged = { ...current, ...body };
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
-          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'voice']) {
+          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'voice', 'image']) {
             if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
               merged[sub] = current[sub] ?? {};
             }
@@ -4953,7 +5377,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendImage', 'genImage'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -5067,6 +5491,53 @@ async function main() {
               merged.context[name] = Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
             }
             if (merged.context.inlineWakeMessages !== undefined) merged.context.inlineWakeMessages = merged.context.inlineWakeMessages === true;
+          }
+          // image：图片库 / 频率上限 / MiniMax 生成配置归一化。
+          // apiKey 留空 = 保持原值（GET 不回显 Key，控制台保存时输入框本来就是空的）；
+          // 要清空必须显式传 clearApiKey=true，避免「打开面板点保存」把 Key 洗掉。
+          if (body.image && typeof body.image === 'object') {
+            const curImg = (current.image && typeof current.image === 'object' && !Array.isArray(current.image)) ? current.image : {};
+            const curGen = (curImg.generation && typeof curImg.generation === 'object' && !Array.isArray(curImg.generation)) ? curImg.generation : {};
+            const next = { ...curImg, ...body.image };
+            if (next.enabled !== undefined) next.enabled = next.enabled === true;
+            if (next.allowAbsolutePath !== undefined) next.allowAbsolutePath = next.allowAbsolutePath === true;
+            for (const [k, min, max, fallback] of [['maxBytes', 1024 * 1024, 20 * 1024 * 1024, 8 * 1024 * 1024], ['maxPerMinute', 0, 100, 3], ['maxPerHour', 0, 1000, 30]]) {
+              const n = Number(next[k]);
+              next[k] = Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : (Number(curImg[k]) || fallback);
+            }
+            const dir = String(next.dir ?? '').trim() || 'images';
+            // 只接受仓库内相对目录：绝对路径 / `..` 会把图片库指到任意位置，等于放开任意文件读取。
+            next.dir = (!path.isAbsolute(dir) && !dir.split(/[\\/]/).includes('..')) ? dir : (curImg.dir ?? 'images');
+            if (body.image.generation && typeof body.image.generation === 'object' && !Array.isArray(body.image.generation)) {
+              const g = { ...curGen, ...body.image.generation };
+              const keyInput = typeof g.apiKey === 'string' ? g.apiKey.trim() : '';
+              if (g.clearApiKey === true) g.apiKey = '';
+              else g.apiKey = keyInput || String(curGen.apiKey ?? '');
+              delete g.clearApiKey;
+              if (g.apiKey.length > 4096) { sendJson({ ok: false, error: 'API Key 过长' }, 400); return; }
+              if (g.apiKey && /\s/.test(g.apiKey)) { sendJson({ ok: false, error: 'API Key 不能包含空白字符' }, 400); return; }
+              try {
+                g.baseUrl = normalizeBaseUrl(String(g.baseUrl ?? ''), String(curGen.baseUrl || IMAGE_GEN_DEFAULTS.baseUrl));
+              } catch (error) {
+                sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+                return;
+              }
+              g.model = /^[A-Za-z0-9._-]{1,64}$/.test(String(g.model ?? '')) ? String(g.model) : (curGen.model ?? IMAGE_GEN_DEFAULTS.model);
+              try {
+                g.aspectRatio = normalizeAspectRatio(String(g.aspectRatio ?? ''), String(curGen.aspectRatio || IMAGE_GEN_DEFAULTS.aspectRatio));
+              } catch {
+                g.aspectRatio = curGen.aspectRatio ?? IMAGE_GEN_DEFAULTS.aspectRatio;
+              }
+              g.apiKeyEnv = /^[A-Z_][A-Z0-9_]{0,63}$/.test(String(g.apiKeyEnv ?? '')) ? String(g.apiKeyEnv) : (curGen.apiKeyEnv ?? IMAGE_GEN_DEFAULTS.apiKeyEnv);
+              const timeout = Number(g.timeoutMs);
+              g.timeoutMs = Number.isFinite(timeout) ? Math.min(300000, Math.max(10000, Math.round(timeout))) : (curGen.timeoutMs ?? IMAGE_GEN_DEFAULTS.timeoutMs);
+              g.promptOptimizer = g.promptOptimizer !== false;
+              g.enabled = g.enabled !== false;
+              next.generation = g;
+            } else {
+              next.generation = { ...curGen };
+            }
+            merged.image = next;
           }
           if (merged.enabled !== undefined) merged.enabled = merged.enabled === true;
           if (merged.provideRecommendations !== undefined) merged.provideRecommendations = merged.provideRecommendations === true;
@@ -6208,6 +6679,203 @@ async function main() {
               return;
             }
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
+        // ── 图片发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const ic = imageCfg();
+          if (!ic.enabled) { sendJson({ ok: false, error: '图片功能已关闭' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2' && !closedAgentMedia) { sendJson({ ok: false, error: '该接口仅 reserved2 或管理员私聊模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_send_image' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          if (kind === 'private' && body.atUserId) { sendJson({ ok: false, error: '私聊不需要 @' }, 400); return; }
+          const replyToMessageId = body.replyToMessageId;
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
+            sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
+            return;
+          }
+          let actualReplyToMessageId = replyToMessageId;
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+            const stForReply = getSocialV2State(key);
+            const resolved = await resolveReplyTargetV2(stForReply, kind, id, String(replyToMessageId).trim());
+            if (!resolved) {
+              sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）' }, 400);
+              return;
+            }
+            actualReplyToMessageId = resolved.messageId;
+          }
+          const source = body.image ?? body.url ?? body.file;
+          try {
+            imageBudgetCheck(key, ic);
+            if (body.dryRun === true) {
+              const { buffer, origin } = await loadImageBuffer(source, ic);
+              const img = bufferToImage(buffer);
+              sendJson({ ok: true, dryRun: true, key, origin, bytes: buffer.length, width: img.width, height: img.height, format: img.format });
+              return;
+            }
+            const sent = await sendImageForV2(key, source, {
+              replyToMessageId: actualReplyToMessageId,
+              atUserId: body.atUserId ?? null,
+              note: body.note ? String(body.note).slice(0, 100) : ''
+            });
+            imageBudgetCommit(key);
+            sendJson({
+              ok: true,
+              key,
+              messageId: sent.messageId,
+              bytes: sent.bytes,
+              width: sent.width,
+              height: sent.height,
+              format: sent.format,
+              origin: sent.origin
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
+        // ── 文生图（AI 通道）：MiniMax 生成 → 落盘 images/ → 直接发到会话 ─────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/generate-image') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const ic = imageCfg();
+          if (!ic.enabled) { sendJson({ ok: false, error: '图片功能已关闭' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2' && !closedAgentMedia) { sendJson({ ok: false, error: '该接口仅 reserved2 或管理员私聊模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('genImage')) { sendJson({ ok: false, error: '工具未启用：qq_gen_image' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          if (!ic.generation.enabled) { sendJson({ ok: false, error: '图片生成已关闭（socialV2.image.generation.enabled=false）' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          const prompt = String(body.prompt ?? '').trim();
+          if (!prompt) { sendJson({ ok: false, error: 'prompt 不能为空' }, 400); return; }
+          let aspectRatio;
+          try { aspectRatio = body.aspectRatio ? normalizeAspectRatio(String(body.aspectRatio)) : ic.generation.aspectRatio; }
+          catch (error) { sendJson({ ok: false, error: error?.message ?? String(error) }, 400); return; }
+          const replyToMessageId = body.replyToMessageId;
+          let actualReplyToMessageId = replyToMessageId;
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+            if (!/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
+              sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
+              return;
+            }
+            const stForReply = getSocialV2State(key);
+            const resolved = await resolveReplyTargetV2(stForReply, kind, id, String(replyToMessageId).trim());
+            if (!resolved) {
+              sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话' }, 400);
+              return;
+            }
+            actualReplyToMessageId = resolved.messageId;
+          }
+          try {
+            const { generated, sent } = await generateAndSendImageForV2(key, {
+              prompt,
+              aspectRatio,
+              replyToMessageId: actualReplyToMessageId,
+              atUserId: body.atUserId ?? null
+            });
+            sendJson({
+              ok: true,
+              key,
+              messageId: sent.messageId,
+              filename: generated.filename,
+              bytes: generated.bytes,
+              width: generated.width,
+              height: generated.height,
+              format: generated.format,
+              aspectRatio: generated.aspectRatio,
+              model: generated.model,
+              latencyMs: generated.latencyMs
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, error?.code === 'NO_API_KEY' ? 503 : 500);
+          }
+          return;
+        }
+
+        // ── 图片状态（控制台）：Key 是否配置、模型、上次生成结果、图片库大小 ──
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/image/status') {
+          const ic = imageCfg();
+          sendJson({
+            ok: true,
+            enabled: ic.enabled,
+            dir: path.basename(ic.dir),
+            allowAbsolutePath: ic.allowAbsolutePath,
+            maxBytes: ic.maxBytes,
+            maxPerMinute: ic.maxPerMinute,
+            maxPerHour: ic.maxPerHour,
+            generation: {
+              enabled: ic.generation.enabled,
+              baseUrl: ic.generation.baseUrl,
+              model: ic.generation.model,
+              aspectRatio: ic.generation.aspectRatio,
+              promptOptimizer: ic.generation.promptOptimizer,
+              timeoutMs: ic.generation.timeoutMs,
+              keyConfigured: Boolean(ic.generation.key),
+              keySource: ic.generation.keySource,
+              keyMasked: ic.generation.key ? maskApiKey(ic.generation.key) : ''
+            },
+            stats: imageStats(),
+            latest: listImageFiles(ic.dir, { limit: 5 })
+          });
+          return;
+        }
+
+        // ── 测试生成（控制台，会消耗一次 MiniMax 额度；可选顺带发到指定会话） ──
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/image/test') {
+          const body = await readBody();
+          const ic = imageCfg();
+          if (!ic.generation.enabled) { sendJson({ ok: false, error: '图片生成已关闭' }, 403); return; }
+          const sendTo = String(body.sendTo ?? '').trim();
+          let target = null;
+          if (sendTo) {
+            target = parseTargetKey(sendTo);
+            if (!target || !modeAllowed(sendTo, target.kind, Number(target.id), cfg, currentMode)) {
+              sendJson({ ok: false, error: '发送目标不在白名单内（config.json allow.groups / allow.private）' }, 403);
+              return;
+            }
+          }
+          try {
+            const prompt = String(body.prompt ?? '').trim() || '一张简洁的测试图：一只蓝色小鲸鱼在云朵上，扁平插画风格';
+            const aspectRatio = body.aspectRatio ? normalizeAspectRatio(String(body.aspectRatio)) : ic.generation.aspectRatio;
+            const generated = await generateImageToLibrary({ prompt, aspectRatio, source: 'console-test' });
+            let sent = null;
+            if (sendTo) {
+              imageBudgetCheck(sendTo, ic);
+              sent = await sendImageForV2(sendTo, generated.filename, { guard: false, note: '[测试图片]', record: false });
+              imageBudgetCommit(sendTo);
+            }
+            sendJson({ ok: true, ...generated, sent: sent ? { key: sendTo, messageId: sent.messageId } : null });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, error?.code === 'NO_API_KEY' ? 503 : 500);
           }
           return;
         }
@@ -12865,9 +13533,24 @@ async function main() {
     //   · 实测踩过：把 wsUrl 指向一个死端口想让它"别连"，启动后仍被改回真实端点并连上。
     // 关掉后仅更新与配置端点一致的 token，不能把另一实例的凭据套到用户指定的地址。
     const followEndpoint = cfg.snowluma?.followDiscoveredEndpoint !== false;
+    // 通配绑定地址不是连接地址：SnowLuma 广播出来的 wsUrl 常是 `ws://0.0.0.0:3001`
+    // （它监听 0.0.0.0），而配置里写的是 `ws://127.0.0.1:3001`。两者其实是同一个端点，
+    // 但直接比 URL 字符串会把它们判成"不同端点"，于是 followDiscoveredEndpoint=false 时
+    // 连 WS 令牌也一起拒绝套用 —— 表现为 HTTP 正常、WS 永远 1006 / rejected unauthorized。
+    // 这里把通配 host 归一成回环再比，只放宽"同一台机器上的同一端口"，不会把 A 实例的凭据
+    // 套到用户指定的 B 地址上（host/port/protocol 仍必须一致）。
+    const normalizeEndpointHost = (hostname) => {
+      const h = String(hostname || '').toLowerCase();
+      return (h === '0.0.0.0' || h === '::' || h === '[::]') ? '127.0.0.1' : h;
+    };
     const sameEndpoint = (a, b) => {
-      try { return new URL(String(a)).href.replace(/\/+$/, '') === new URL(String(b)).href.replace(/\/+$/, ''); }
-      catch { return false; }
+      try {
+        const ua = new URL(String(a));
+        const ub = new URL(String(b));
+        return ua.protocol === ub.protocol
+          && normalizeEndpointHost(ua.hostname) === normalizeEndpointHost(ub.hostname)
+          && ua.port === ub.port;
+      } catch { return false; }
     };
     const acceptHttpToken = followEndpoint || sameEndpoint(r.baseUrl, cfg.snowluma.httpUrl || 'http://127.0.0.1:3000');
     const acceptWsToken = !!r.wsUrl && typeof r.wsToken === 'string'

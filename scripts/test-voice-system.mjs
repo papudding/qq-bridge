@@ -145,7 +145,7 @@ console.log('## qq-bridge 语音系统：MCP 工具与开关映射');
   ok(/voice\?\.enabled !== false/.test(mcp), '注册期也检查 voice.enabled（关闭时不注册，省 token）');
   const bridge = read('src/bridge.js');
   ok(/sendVoice: 'qq_send_voice \/ qq_list_voices'/.test(bridge), 'qq_get_prompt 的 toolMap 含语音工具');
-  ok(/'sendVoice'\]/.test(bridge), 'config API 的 toolFlags 含 sendVoice');
+  ok(/const toolFlags = \[[\s\S]*?'sendVoice'/.test(bridge), 'config API 的 toolFlags 含 sendVoice');
   const ex = JSON.parse(read('config.example.json'));
   // 这一段查的是**「出厂默认就该是关的」**这类契约 —— 权威声明是随仓库发布的
   // config.example.json。**刻意不查用户的 config.json**（早期版本查的是它，两个毛病）：

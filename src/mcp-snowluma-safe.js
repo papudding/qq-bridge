@@ -377,6 +377,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_list_stickers: 'listStickers',
   qq_get_sticker_image: 'getStickerImage',
   qq_send_sticker: 'sendSticker',
+  qq_send_image: 'sendImage',
+  qq_gen_image: 'genImage',
   qq_collect_sticker: 'collectSticker',
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
@@ -1285,6 +1287,69 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `发送表情失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.image?.enabled !== false && cfg.socialV2?.tools?.genImage !== false) {
+  server.tool(
+    'qq_gen_image',
+    '用 MiniMax 按提示词现场画一张图，并直接发到指定 QQ 会话。注意：① 图片是**单独一条消息**，不能在同一气泡里附带文字——想配一句话请先用 qq_send_message / qq_reply 发，再调用本工具；② 生成通常要 10~60 秒，失败会返回可读原因（Key 未配置 / 额度不足 / 限流 / 提示词被内容安全拦截），失败就如实告诉对方，绝不假装发了图；③ 只在真需要画面时用（有人明确要图、讲故事需要配图、玩梗），别每轮都画、别连发刷屏；④ 返回 filename 可用于之后 qq_send_image 重发这张图。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      prompt: z.string().describe('画面描述（最多 1500 字；写清主体、场景、风格；中文即可）'),
+      aspectRatio: z.enum(['1:1', '16:9', '4:3', '3:2', '2:3', '3:4', '9:16', '21:9']).optional().describe('画幅，默认 1:1；横图用 16:9，竖图用 9:16'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊可选，私聊不可用）')
+    },
+    async ({ key, token, prompt, aspectRatio, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/generate-image', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            token,
+            prompt: String(prompt),
+            aspectRatio: aspectRatio ? String(aspectRatio) : undefined,
+            replyToMessageId,
+            atUserId: atUserId ?? null
+          }),
+          headers: { 'x-agent-token': token },
+          // 生成 10~60 秒 + 上传，给足余量（桥接侧 MiniMax 自身是 180 秒超时）。
+          timeoutMs: 300000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `生成图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.image?.enabled !== false && cfg.socialV2?.tools?.sendImage !== false) {
+  server.tool(
+    'qq_send_image',
+    '把一张已有图片发到指定 QQ 会话：image 传图片库（qq-bridge/images/）里的文件名，或 http(s) 图片地址。图片是**单独一条消息**，不能附带文字——想说话请先用 qq_send_message / qq_reply 发。只发你确认存在的图（qq_gen_image 返回的 filename，或对方给你的图片地址），不要编造文件名；需要引用/点名时传 replyToMessageId / atUserId。普通闲聊别频繁发图。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      image: z.string().describe('图片库（images/）里的文件名，或 http(s) 图片地址'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊可选，私聊不可用）')
+    },
+    async ({ key, token, image, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-image', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, image: String(image), replyToMessageId, atUserId: atUserId ?? null }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 180000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送图片失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

@@ -2050,6 +2050,8 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="stickerNote"> <span><b>qq_sticker_note</b><span class="meta">给表情记录本地含义/标签/用法</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="setStickerRemark"> <span><b>qq_set_sticker_remark</b><span class="meta">修改 QQ 官方表情备注（默认禁用，慎用）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendVoice"> <span><b>qq_send_voice / qq_list_voices</b><span class="meta">发送语音条（只能发语音库里的音频；偶然而为的强表达）</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendImage"> <span><b>qq_send_image</b><span class="meta">发送图片库里的文件或 http(s) 图片（单独一条消息，不能带文字）</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="genImage"> <span><b>qq_gen_image</b><span class="meta">用 MiniMax 现场画图并发送（消耗订阅额度）</span></span></label>
       </div>
       <div class="meta" style="margin-top:6px">二代黑话学习：AI 可用 <code>qq_slang_submit</code> 提交陌生词，也可由桥接自动提取；管理员在「黑话词库」页面筛选确认后，词条会自动写入黑话提示词并注入 <code>qq_get_prompt</code> 与后续唤醒。</div>
 
@@ -2074,6 +2076,54 @@ button:active:not(:disabled) {
       </div>
 
       </div></details>
+<details class="settings-group"><summary>图片生成（MiniMax）与图片发送</summary><div class="settings-content">
+      <div id="imageStatusLine" class="meta" style="margin-bottom:8px">状态加载中…</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <label style="flex:0 0 auto"><input type="checkbox" id="imageEnabled" style="width:auto"> 启用图片发送</label>
+        <label style="flex:0 0 auto"><input type="checkbox" id="imageGenEnabled" style="width:auto"> 启用 MiniMax 生成</label>
+        <label style="flex:0 0 auto"><input type="checkbox" id="imageAllowAbs" style="width:auto"> 允许发库外绝对路径（慎用）</label>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">API Key</label>
+        <input type="password" id="imageApiKey" placeholder="留空 = 保持现有 Key（不会回显）" style="flex:1" autocomplete="new-password">
+        <button type="button" class="btn-secondary" id="imageKeyClearBtn">清除 Key</button>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">站点</label>
+        <select id="imageBaseUrl" style="width:230px">
+          <option value="https://api.minimax.cn">国内站 api.minimax.cn</option>
+          <option value="https://api.minimax.io">国际站 api.minimax.io</option>
+        </select>
+        <label style="flex:0 0 auto">模型</label><input type="text" id="imageModel" style="width:110px" value="image-01">
+        <label style="flex:0 0 auto">默认画幅</label>
+        <select id="imageAspect" style="width:90px">
+          <option value="1:1">1:1</option><option value="16:9">16:9</option><option value="4:3">4:3</option>
+          <option value="3:2">3:2</option><option value="2:3">2:3</option><option value="3:4">3:4</option>
+          <option value="9:16">9:16</option><option value="21:9">21:9</option>
+        </select>
+      </div>
+      <div class="row">
+        <label style="flex:1">每分钟最多（张）</label><input type="number" id="imagePerMin" min="0" max="100" style="width:80px">
+        <label style="flex:1">每小时最多（张）</label><input type="number" id="imagePerHour" min="0" max="1000" style="width:80px">
+        <label style="flex:1">生成超时（秒）</label><input type="number" id="imageTimeoutSec" min="10" max="300" style="width:80px">
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto">测试提示词</label>
+        <input type="text" id="imageTestPrompt" placeholder="留空 = 默认测试图" style="flex:1">
+        <label style="flex:0 0 auto">测试后发到</label>
+        <input type="text" id="imageTestSendTo" placeholder="可空，如 private:123456" style="width:190px">
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <button type="button" id="imageTestBtn">测试生成</button>
+        <button type="button" class="btn-secondary" id="imageRefreshBtn">刷新状态</button>
+        <span id="imageMsg" class="meta"></span>
+      </div>
+      <div class="meta" style="margin-top:6px">
+        Key 存在 <code>config.json</code>（权限 0600），页面只显示「已配置 + 掩码」，不会回显完整值；也可以用 <code>MINIMAX_API_KEY</code> 环境变量。
+        「测试生成」会真实调用一次 MiniMax（消耗订阅额度），生成的图存进图片库 <code>qq-bridge/images/</code>，可顺带发到指定会话。
+        AI 侧工具：<code>qq_gen_image</code>（生成并发送）、<code>qq_send_image</code>（发图片库文件或 http(s) 图片）。
+      </div>
+    </div></details>
 <details class="settings-group"><summary>唤醒推荐值（仅参考，AI 可不遵守）</summary><div class="settings-content">
       <div class="row">
         <label style="flex:1">默认模式</label>
@@ -3262,6 +3312,70 @@ async function sendVoiceFromConsole() {
   }
 }
 
+// ── 图片生成（MiniMax）状态与测试 ─────────────────────────────────────────
+function fmtImageTime(ts) {
+  if (!ts) return '从未';
+  const d = new Date(ts);
+  const p = n => String(n).padStart(2, '0');
+  return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+async function loadImageStatus() {
+  const line = document.getElementById('imageStatusLine');
+  if (!line) return;
+  try {
+    const r = await api('/api/socialV2/image/status');
+    const g = r.generation || {};
+    const st = r.stats || {};
+    const keySrc = g.keySource === 'config' ? 'config.json' : (g.keySource && g.keySource !== 'none' ? g.keySource : '');
+    const keyTxt = g.keyConfigured ? ('已配置' + (keySrc ? '（' + keySrc + '，' + (g.keyMasked || '') + '）' : '')) : '未配置';
+    const last = st.lastAt
+      ? ((st.lastOk ? '成功 ' : '失败 ') + fmtImageTime(st.lastAt)
+        + (st.lastOk ? ('，' + (st.lastLatencyMs || 0) + 'ms，' + (st.lastFile || '')) : ('（' + (st.lastError || '未知错误') + '）')))
+      : '从未生成';
+    line.innerHTML = ''
+      + '<span class="pill ' + (g.keyConfigured ? 'g' : 'r') + '">Key ' + keyTxt + '</span> '
+      + '<span class="pill ' + (r.enabled ? 'g' : 'r') + '">图片发送 ' + (r.enabled ? '开' : '关') + '</span> '
+      + '<span class="pill ' + (g.enabled ? 'g' : 'r') + '">生成 ' + (g.enabled ? '开' : '关') + '</span> '
+      + '模型 <code>' + (g.model || '') + '</code> · 站点 <code>' + (g.baseUrl || '') + '</code> · 图片库 <code>' + (r.dir || 'images') + '/</code>'
+      + '（' + ((r.latest || []).length ? '最近：' + r.latest.join('、') : '空') + '）'
+      + '<br>累计生成 ' + (st.generated || 0) + ' 张 / 失败 ' + (st.failed || 0) + ' 次 · 上次：' + last;
+  } catch (error) {
+    line.textContent = '状态获取失败：' + (error && error.message ? error.message : error);
+  }
+}
+
+async function testImageGeneration() {
+  const msg = document.getElementById('imageMsg');
+  const btn = document.getElementById('imageTestBtn');
+  const prompt = document.getElementById('imageTestPrompt').value.trim();
+  const sendTo = document.getElementById('imageTestSendTo').value.trim();
+  btn.disabled = true;
+  msg.className = 'meta';
+  msg.textContent = '生成中（通常 10~60 秒）…';
+  try {
+    const r = await api('/api/socialV2/image/test', 'POST', {
+      prompt: prompt || undefined,
+      sendTo: sendTo || undefined,
+      aspectRatio: document.getElementById('imageAspect').value
+    });
+    if (r && r.ok) {
+      msg.className = 'meta ok';
+      msg.textContent = '✅ 已生成 ' + r.filename + '（' + r.width + '×' + r.height + '，' + r.latencyMs + 'ms）'
+        + (r.sent ? '，已发到 ' + r.sent.key + '（messageId=' + (r.sent.messageId ?? '?') + '）' : '，未发送');
+    } else {
+      msg.className = 'meta err';
+      msg.textContent = '❌ ' + ((r && r.error) || '失败');
+    }
+  } catch (error) {
+    msg.className = 'meta err';
+    msg.textContent = '❌ ' + (error && error.message ? error.message : error);
+  } finally {
+    btn.disabled = false;
+    loadImageStatus();
+  }
+}
+
 // ── 二代仿真模式（reserved2）配置 ─────────────────────────────────────────
 async function loadV2Config() {
   try {
@@ -3333,6 +3447,36 @@ async function loadV2Config() {
     document.getElementById('v2StickerCollectPerMin').value = stkCollect.maxPerMinute ?? 2;
     document.getElementById('v2StickerCollectPerHour').value = stkCollect.maxPerHour ?? 10;
     document.getElementById('v2StickerCollectRemarkMax').value = stkCollect.maxRemarkChars ?? 20;
+    const im = c.image || {};
+    const imgGen = im.generation || {};
+    document.getElementById('imageEnabled').checked = im.enabled !== false;
+    document.getElementById('imageGenEnabled').checked = imgGen.enabled !== false;
+    document.getElementById('imageAllowAbs').checked = im.allowAbsolutePath === true;
+    document.getElementById('imagePerMin').value = im.maxPerMinute ?? 3;
+    document.getElementById('imagePerHour').value = im.maxPerHour ?? 30;
+    document.getElementById('imageModel').value = imgGen.model || 'image-01';
+    document.getElementById('imageAspect').value = imgGen.aspectRatio || '1:1';
+    document.getElementById('imageTimeoutSec').value = Math.round((imgGen.timeoutMs || 180000) / 1000);
+    {
+      const sel = document.getElementById('imageBaseUrl');
+      const want = imgGen.baseUrl || 'https://api.minimax.cn';
+      if (![...sel.options].some(o => o.value === want)) {
+        const opt = document.createElement('option');
+        opt.value = want;
+        opt.textContent = want + '（自定义）';
+        sel.appendChild(opt);
+      }
+      sel.value = want;
+    }
+    {
+      const keyEl = document.getElementById('imageApiKey');
+      keyEl.value = '';
+      keyEl.dataset.clear = '0';
+      keyEl.placeholder = imgGen.apiKeyConfigured
+        ? '已配置（' + (imgGen.apiKeyMasked || '****') + '，留空保持不变）'
+        : '未配置：粘贴 MiniMax M Plan API Key';
+    }
+    loadImageStatus();
     const ctx = c.context || {};
     document.getElementById('v2ContextRecentLimit').value = ctx.recentLimit ?? 100;
     document.getElementById('v2ContextUnreadLimit').value = ctx.unreadLimit ?? 30;
@@ -3417,6 +3561,28 @@ async function saveV2Config() {
         maxRemarkChars: Math.min(50, Math.max(1, Math.round(Number(document.getElementById('v2StickerCollectRemarkMax').value) || 20)))
       }
     },
+    image: (() => {
+      const keyEl = document.getElementById('imageApiKey');
+      const apiKey = keyEl.value.trim();
+      const clearKey = keyEl.dataset.clear === '1' && !apiKey;
+      keyEl.value = '';
+      keyEl.dataset.clear = '0';
+      return {
+        enabled: document.getElementById('imageEnabled').checked,
+        allowAbsolutePath: document.getElementById('imageAllowAbs').checked,
+        maxPerMinute: Math.max(0, Math.round(Number(document.getElementById('imagePerMin').value) || 0)),
+        maxPerHour: Math.max(0, Math.round(Number(document.getElementById('imagePerHour').value) || 0)),
+        generation: {
+          enabled: document.getElementById('imageGenEnabled').checked,
+          baseUrl: document.getElementById('imageBaseUrl').value,
+          model: document.getElementById('imageModel').value.trim() || 'image-01',
+          aspectRatio: document.getElementById('imageAspect').value,
+          timeoutMs: Math.max(10, Math.min(300, Math.round(Number(document.getElementById('imageTimeoutSec').value) || 180))) * 1000,
+          apiKey,
+          clearApiKey: clearKey
+        }
+      };
+    })(),
     context: {
       recentLimit: Math.round(Number(document.getElementById('v2ContextRecentLimit').value) || 100),
       unreadLimit: Math.round(Number(document.getElementById('v2ContextUnreadLimit').value) || 30),
@@ -3842,6 +4008,17 @@ document.getElementById('v2ConfigSave').addEventListener('click', saveV2Config);
 document.getElementById('v2ConfigSaveTop').addEventListener('click', saveV2Config);
 document.getElementById('voiceRefreshBtn').addEventListener('click', () => loadVoiceLibrary(true));
 document.getElementById('voiceSendBtn').addEventListener('click', sendVoiceFromConsole);
+document.getElementById('imageRefreshBtn').addEventListener('click', () => loadImageStatus());
+document.getElementById('imageTestBtn').addEventListener('click', testImageGeneration);
+document.getElementById('imageKeyClearBtn').addEventListener('click', () => {
+  const el = document.getElementById('imageApiKey');
+  el.value = '';
+  el.dataset.clear = '1';
+  el.placeholder = '保存后清除已配置的 Key';
+  const msg = document.getElementById('imageMsg');
+  msg.className = 'meta';
+  msg.textContent = '已标记：点「保存」后才会真正清除 Key';
+});
 async function refreshV2Activity() {
   try {
     const r = await api('/api/socialV2/activity');

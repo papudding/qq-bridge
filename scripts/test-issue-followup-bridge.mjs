@@ -240,6 +240,22 @@ await test('#71/#115 discovered credentials remain paired with their HTTP and WS
   }
 });
 
+await test('#r2 wildcard bind address pairs with loopback endpoint; other hosts still rejected', {
+  config: { snowluma: { followDiscoveredEndpoint: false, httpUrl: 'http://127.0.0.1:3000', wsUrl: 'ws://127.0.0.1:3001', accessToken: 'old-http-secret' } }
+}, async (h) => {
+  h.bot.url = h.cfg.snowluma.wsUrl;
+  h.bot.accessToken = 'old-ws-secret';
+  // SnowLuma 广播的监听地址是 0.0.0.0：它就是本机同一个端口的回环地址，应当接受其令牌。
+  await h.applyHealedTokens({ baseUrl: 'http://0.0.0.0:3000', wsUrl: 'ws://0.0.0.0:3001', token: 'wild-http-secret', wsToken: 'wild-ws-secret' });
+  assert.equal(h.cfg.snowluma.accessToken, 'wild-http-secret');
+  assert.equal(h.bot.accessToken, 'wild-ws-secret');
+  assert.equal(h.cfg.snowluma.wsUrl, 'ws://127.0.0.1:3001', '关掉端点跟随时不改写用户写的 wsUrl');
+  // 其它主机的同端口仍然是"另一个端点"，凭据必须保持不动。
+  await h.applyHealedTokens({ baseUrl: 'http://192.0.2.10:3000', wsUrl: 'ws://192.0.2.10:3001', token: 'foreign-http-secret', wsToken: 'foreign-ws-secret' });
+  assert.equal(h.cfg.snowluma.accessToken, 'wild-http-secret');
+  assert.equal(h.bot.accessToken, 'wild-ws-secret');
+});
+
 await test('#115 auto-generated console token has no prefix in logs', { config: { consoleToken: '' } }, async (h) => {
   const server = h.startConsoleServer();
   try {
