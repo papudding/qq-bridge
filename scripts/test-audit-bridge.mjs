@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import http from 'node:http';
+import net from 'node:net';
 
 let failures = 0;
 async function test(name, run) {
@@ -434,6 +435,87 @@ await test('malformed HTTP request targets return 400 without hanging', async (h
     assert.equal(noToken.status, 403, '空会话令牌必须被拒绝');
     console.log('PASS console rejects foreign Host headers, non-exact tokens and token-less authorize/read');
   } catch (error) { failures++; console.error('FAIL console transport guards:', error.message); }
+  finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
+}
+
+// ── config.consoleHost：显式配置的非回环地址可以作为 Host / Origin 访问控制台
+//    （Tailscale 网卡直连或 tailscale serve 反代场景），其余非回环 authority 仍然拒绝。
+{
+  // consoleHost 取一个「不在回环白名单字面量里」的地址：
+  //   - 能绑上（Linux / 有别名网卡的机器）→ 走「非回环监听 + 补开 127.0.0.1」的路径；
+  //   - 绑不上（macOS 默认只有 127.0.0.1，返回 EADDRNOTAVAIL）→ 走回环回退路径。
+  // 两条路径都必须放行 consoleHost 这个 Host，并保持其它非回环 authority 拒绝。
+  const h = await bridgeHarness({ config: { consoleHost: '127.0.0.5', consoleTrustedHosts: ['trusted.example.test'] } });
+  const server = h.startConsoleServer();
+  try {
+    // 不能用 'listening' 事件等就绪：回退路径会 removeAllListeners('listening') 后重新
+    // listen，可能把这里注册的监听器一起摘掉。改为等 address() 就绪。
+    let bound = null;
+    for (let i = 0; i < 300 && !bound; i += 1) {
+      bound = server.address();
+      if (!bound) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(bound, '控制台应最终进入监听状态（绑定成功或回环回退）');
+    const port = bound.port;
+    // 请求固定走 127.0.0.1：绑定失败时它是回退后的主监听，绑定成功时它是补开的内部监听。
+    const waitLoopback = async () => {
+      for (let i = 0; i < 120; i += 1) {
+        const ok = await new Promise((resolve) => {
+          const socket = net.connect({ host: '127.0.0.1', port });
+          socket.once('connect', () => { socket.destroy(); resolve(true); });
+          socket.once('error', () => { socket.destroy(); resolve(false); });
+        });
+        if (ok) return true;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return false;
+    };
+    assert.ok(await waitLoopback(), '127.0.0.1 监听应可用（内部脚本/MCP 工具调控制台依赖它）');
+    const call = (path, method = 'GET', headers = {}, body) => new Promise((resolve, reject) => {
+      const request = http.request(
+        // agent: false —— 本段用完即关，避免 keep-alive 连接把补开的监听句柄拖住。
+        { host: '127.0.0.1', port, path, method, agent: false, headers: { 'content-type': 'application/json', ...headers } },
+        (response) => {
+          let data = '';
+          response.on('data', (chunk) => { data += chunk; });
+          response.on('end', () => resolve({ status: response.statusCode, body: data }));
+        },
+      );
+      request.on('error', reject);
+      request.setTimeout(3000, () => request.destroy(new Error('request hung')));
+      request.end(body === undefined ? undefined : JSON.stringify(body));
+    });
+    const admin = { 'x-console-token': 'fixture-console-token' };
+    const allowedHost = `127.0.0.5:${port}`;
+
+    // consoleHost 本尊加三个回环 authority 都要放行。
+    for (const host of [allowedHost, `127.0.0.1:${port}`, `localhost:${port}`]) {
+      const res = await call('/api/status', 'GET', { ...admin, host });
+      assert.equal(res.status, 200, `consoleHost 模式下 Host=${host} 应被接受，实际 HTTP ${res.status}`);
+    }
+    // consoleTrustedHosts（host 条目匹配任意端口）：域名/TLS 反代入口要能进来。
+    const trustedHost = `trusted.example.test:${port}`;
+    const trustedRes = await call('/api/status', 'GET', { ...admin, host: trustedHost });
+    assert.equal(trustedRes.status, 200, `consoleTrustedHosts 里的 Host=${trustedHost} 应被接受，实际 HTTP ${trustedRes.status}`);
+    const trustedOrigin = await call('/api/does-not-exist', 'POST', { ...admin, host: `127.0.0.1:${port}`, origin: `http://${trustedHost}` }, {});
+    assert.equal(trustedOrigin.status, 404, `来自 consoleTrustedHosts 的 Origin 应通过 CSRF 检查，实际 HTTP ${trustedOrigin.status}`);
+    // 其它非回环 authority 仍必须拒绝：只放行 consoleHost 与 consoleTrustedHosts。
+    for (const host of [`evil.example.com:${port}`, `127.0.0.6:${port}`, `other.example.test:${port}`]) {
+      const res = await call('/api/status', 'GET', { ...admin, host });
+      assert.equal(res.status, 403, `consoleHost 模式下 Host=${host} 必须被拒绝，实际 HTTP ${res.status}`);
+    }
+    // Host 放行不等于免鉴权：令牌仍然必填。
+    const noToken = await call('/api/status', 'GET', { host: allowedHost });
+    assert.equal(noToken.status, 401, 'consoleHost 地址也必须携带控制台令牌');
+
+    // CSRF Origin 白名单同步放行 consoleHost；其它 Origin 仍拒绝。
+    const okOrigin = await call('/api/does-not-exist', 'POST', { ...admin, host: allowedHost, origin: `http://${allowedHost}` }, {});
+    assert.equal(okOrigin.status, 404, `来自 consoleHost 的 Origin 应通过 CSRF 检查，实际 HTTP ${okOrigin.status}`);
+    const badOrigin = await call('/api/does-not-exist', 'POST', { ...admin, host: `127.0.0.1:${port}`, origin: `http://evil.example.com:${port}` }, {});
+    assert.equal(badOrigin.status, 403, '其它 Origin 的写请求必须被 CSRF 检查拒绝');
+
+    console.log('PASS consoleHost allows its own authority and keeps foreign Host/Origin rejected');
+  } catch (error) { failures++; console.error('FAIL consoleHost remote access:', error.message); }
   finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
 }
 

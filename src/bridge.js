@@ -708,6 +708,29 @@ function ignoredSender(id, cfg) {
   return Array.isArray(cfg.ignore?.sendQQ) && cfg.ignore.sendQQ.includes(sender);
 }
 
+/**
+ * 控制台额外放行的 authority（Host/Origin 白名单，见 config.consoleTrustedHosts）。
+ *
+ * 条目标是 `host:port`（精确匹配）或 `host`（匹配任意端口），与 DSH 的 --trusted-host 语义一致。
+ * 只用于反代/域名场景（例如 tailscale serve 的 `https://<host>:3100` 入口）：
+ * 控制台令牌仍然必填，这里只解除「Host 不是我认识的地址」的 DNS rebinding 拦截。
+ */
+function normalizeConsoleTrustedHosts(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('consoleTrustedHosts 必须是字符串数组');
+  const out = [];
+  for (const raw of value) {
+    if (typeof raw !== 'string' || !raw.trim()) throw new Error('consoleTrustedHosts 条目必须是非空字符串');
+    const s = raw.trim().toLowerCase();
+    const m = /^(\[[0-9a-f:.]+\]|[a-z0-9._-]+)(?::(\d{1,5}))?$/.exec(s);
+    if (!m) throw new Error(`consoleTrustedHosts 条目格式不合法（应为 host:port 或 host）：${raw}`);
+    const port = m[2] === undefined ? null : Number(m[2]);
+    if (port !== null && (port < 1 || port > 65535)) throw new Error(`consoleTrustedHosts 端口不合法：${raw}`);
+    out.push({ host: m[1], port });
+  }
+  return out;
+}
+
 // ── 配置 ────────────────────────────────────────────────────────────────────
 function loadConfig() {
   const p = path.join(ROOT, 'config.json');
@@ -752,6 +775,12 @@ function loadConfig() {
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
     consolePort: file.consolePort ?? 3100,
+    // 控制台绑定地址：默认只监听 127.0.0.1；填本机具体网卡地址（如 Tailscale 的 100.x）
+    // 可让该地址直接访问控制台。绑非回环地址时会额外监听 127.0.0.1 供内部调用。
+    consoleHost: String(file.consoleHost ?? '127.0.0.1').trim() || '127.0.0.1',
+    // 额外放行的 Host/Origin authority（host:port 精确、或 host 任意端口）。
+    // 用于 tailscale serve 之类的域名反代入口；默认空 = 只认回环与 consoleHost。
+    consoleTrustedHosts: normalizeConsoleTrustedHosts(file.consoleTrustedHosts),
     consoleToken: file.consoleToken ?? '',
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
@@ -2904,7 +2933,7 @@ async function main() {
     log('⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent');
   } else if (!cfg.allow.private.length && !cfg.allow.groups.length) {
     // 否则这是一个「静默无响应」陷阱：消息全被丢弃，用户只看到 QQ 上毫无反应。
-    log(`⚠️  白名单为空且 allowAllWhenEmpty=false：不会响应任何 QQ 消息。请在 config.json 填 allow.private / allow.groups，或在控制台 http://127.0.0.1:${cfg.consolePort} 填写白名单`);
+    log(`⚠️  白名单为空且 allowAllWhenEmpty=false：不会响应任何 QQ 消息。请在 config.json 填 allow.private / allow.groups，或在控制台 http://${cfg.consoleHost || '127.0.0.1'}:${cfg.consolePort} 填写白名单`);
   }
   // 未配置管理员 QQ 时，一串功能会「静默失灵」：审批永远无法被回答（agent 一直等到超时）、
   // 管理命令全部被拒、封闭 agent 模式实际不可达。这里在启动日志里说清楚，避免排查时误判。
@@ -4004,6 +4033,12 @@ async function main() {
 
   function startConsoleServer() {
     const port = cfg.consolePort ?? 3100;
+    // 控制台绑定地址（见 config.consoleHost）：默认 127.0.0.1，改成具体网卡地址可远程访问。
+    const consoleHost = String(cfg.consoleHost ?? '127.0.0.1').trim() || '127.0.0.1';
+    const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1', '[::1]'];
+    const isLoopbackHost = LOOPBACK_HOSTS.includes(consoleHost);
+    // 绑非回环地址时补开的 127.0.0.1 监听（内部调用用），close 时一并关掉。
+    let loopbackServer = null;
     // 控制台鉴权：优先用 config.consoleToken，未配置则自动生成并持久化，不再默认无鉴权。
     // 使用 let 以便控制台内手动修改令牌后热更新。
     const configuredToken = String(cfg.consoleToken ?? '').trim();
@@ -4077,7 +4112,8 @@ async function main() {
       );
     };
 
-    const server = http.createServer(async (req, res) => {
+    // 具名 handler：consoleHost 非回环时，还要用同一个 handler 补开一个 127.0.0.1 监听。
+    const consoleRequestHandler = async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
       catch {
@@ -4166,18 +4202,33 @@ async function main() {
         res.end();
         return;
       }
-      // Host 头校验（DNS rebinding 硬化）：控制台只监听 127.0.0.1，因此合法请求的 Host
-      // 只可能是 127.0.0.1 / localhost / [::1] 加本端口。攻击者用一个 TTL=0 的域名解析到
-      // 127.0.0.1 时，浏览器会把 evil.com:3100 当作同源，Origin 校验随之失效；卡住 Host
-      // 这一层后，这类请求在进入任何业务分支之前就被拒掉。
-      // 反代/端口转发场景会被一并拒绝——这是有意的（要远程访问请用 SSH 隧道并自行承担）。
+      // Host 头校验（DNS rebinding 硬化）：合法请求的 Host 只可能是回环地址加本端口、
+      // 显式配置的 consoleHost（绑 Tailscale 网卡 / 通过 tailscale serve 反代时），
+      // 以及 config.consoleTrustedHosts 里显式列出的 authority（域名反代入口）。
+      // 攻击者用一个 TTL=0 的域名解析到本机地址时，浏览器会把 evil.com:3100 当作同源，
+      // Origin 校验随之失效；卡住 Host 这一层后，这类请求在进入任何业务分支之前就被拒掉。
+      // 注意：白名单之外的非回环 authority 仍一律拒绝。
       const hostHeader = String(req.headers.host ?? '');
       // 用**实际绑定端口**而不是配置值：测试夹具用 consolePort: 0 让系统分配端口，
       // 配置里那个 0 不是请求里的 Host 端口。请求必然发生在 listen 之后，所以这里拿得到。
       const boundPort = server.address()?.port ?? port;
-      const allowedHosts = [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`];
-      if (!allowedHosts.includes(hostHeader.toLowerCase())) {
-        sendJson({ ok: false, error: `Host 头不被允许（${hostHeader || '缺失'}）：控制台只接受本机回环访问` }, 403);
+      const allowedHosts = [
+        `127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`,
+        ...(isLoopbackHost ? [] : [`${consoleHost}:${boundPort}`.toLowerCase()])
+      ];
+      // canTrustAuthority：白名单本地条目 + consoleTrustedHosts（host 条目匹配任意端口）。
+      const authorityAllowed = (value) => {
+        const lower = String(value ?? '').trim().toLowerCase();
+        if (!lower) return false;
+        if (allowedHosts.includes(lower)) return true;
+        const m = /^(\[[^\]]+\]|[^:]+)(?::(\d{1,5}))?$/.exec(lower);
+        if (!m) return false;
+        const hostPart = m[1];
+        const portPart = m[2] === undefined ? null : Number(m[2]);
+        return (cfg.consoleTrustedHosts ?? []).some((entry) => entry.host === hostPart && (entry.port === null || entry.port === portPart));
+      };
+      if (!authorityAllowed(hostHeader)) {
+        sendJson({ ok: false, error: `Host 头不被允许（${hostHeader || '缺失'}）：控制台只接受本机回环或 config.consoleHost / consoleTrustedHosts 指定的地址访问` }, 403);
         return;
       }
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
@@ -4249,7 +4300,8 @@ async function main() {
         if (origin) {
           let originHost = '';
           try { originHost = new URL(String(origin)).host; } catch {}
-          if (![`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`].includes(originHost)) {
+          // 与 Host 白名单一致：consoleHost / consoleTrustedHosts 指向的地址才算同源页面。
+          if (!authorityAllowed(originHost)) {
             sendJson({ ok: false, error: '跨站请求被拒绝' }, 403);
             return;
           }
@@ -8456,17 +8508,40 @@ async function main() {
         const status = Number(error?.statusCode) || 500;
         sendJson({ ok: false, error: error?.message ?? String(error) }, status);
       }
-    });
-    server.listen(port, '127.0.0.1', () => {
-      log(`本地控制台已启动：http://127.0.0.1:${port}`);
+    };
+    const server = http.createServer(consoleRequestHandler);
+    server.listen(port, consoleHost, () => {
+      log(`本地控制台已启动：http://${consoleHost}:${port}`);
+      // 绑的是非回环地址时，再补一个 127.0.0.1 监听：mcp-snowluma-safe 的工具层和
+      // scripts/*.mjs 一律按 127.0.0.1:consolePort 调控制台 API，只绑单地址会让这些
+      // 内部调用全部 ECONNREFUSED（表现为所有 v2 工具报 等待失败/发送失败）。
+      if (!isLoopbackHost && !loopbackServer) {
+        loopbackServer = http.createServer(consoleRequestHandler);
+        loopbackServer.on('error', (error) => log(`控制台回环监听失败（非致命）: ${error?.message ?? error}`));
+        loopbackServer.listen(port, '127.0.0.1', () => log(`控制台回环监听：http://127.0.0.1:${port}`));
+        // 主 server 关闭时（测试夹具会主动 close）一并释放回环监听，避免留下悬挂句柄。
+        server.on('close', () => { try { loopbackServer?.close(); } catch {} });
+      }
     });
     // 端口被占用说明已有实例在跑：以 exit 2 退出，守护脚本会识别为"已有实例"而不是无限重启
     server.on('error', (error) => {
-      log(`控制台服务错误: ${error?.message ?? error}`);
       if (error?.code === 'EADDRINUSE') {
+        log(`控制台服务错误: ${error?.message ?? error}`);
         console.error(`[bridge] 控制台端口 ${port} 已被占用（可能已有实例在运行），退出。`);
         process.exit(2);
       }
+      // 绑定地址在本机不存在（最常见：Tailscale 还没起来 / 退出登录 / tailscaled 跑在
+      // userspace-networking 模式下根本没有该网卡）。这是**预期内**的情况，不算服务错误：
+      // 退回只监听回环并在日志里说明，不要因此把整个 QQ 机器人拖死。
+      if (error?.code === 'EADDRNOTAVAIL' && !isLoopbackHost) {
+        // 上一次 listen 注册的 listening 回调仍挂在 server 上，第二次 listen 成功时会把
+        // 它一并触发（表现成「已启动：http://<网卡地址>」外加一个注定 EADDRINUSE 的回环监听）。
+        server.removeAllListeners('listening');
+        log(`⚠️ 控制台绑定地址 ${consoleHost} 在本机不存在，已退回只监听 127.0.0.1:${port}（Host 头仍放行 ${consoleHost}，可配合 tailscale serve 反代）`);
+        try { server.listen(port, '127.0.0.1', () => log(`本地控制台已启动（回环回退）：http://127.0.0.1:${port}`)); } catch {}
+        return;
+      }
+      log(`控制台服务错误: ${error?.message ?? error}`);
       process.exit(1);
     });
     return server;

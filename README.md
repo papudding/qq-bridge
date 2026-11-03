@@ -73,6 +73,8 @@ npm start
 
 打开 [本地控制台](http://127.0.0.1:3100)，用启动日志中的令牌登录；自动生成的令牌保存在 `state/console-token`。新装默认使用二代仿真模式（`reserved2`），会选择性发言；测试收发时可先切到 `chat`，再从白名单会话发送消息。
 
+控制台默认只监听 `127.0.0.1`。如需从 Tailscale 等本机网卡地址访问，把 `config.json` 的 `consoleHost` 设为该网卡地址（例如 Tailscale 的 `100.x`）；若还要通过域名/TLS 入口（如 `tailscale serve` 的 `https://<机器名>:3100`）访问，把该 authority 加进 `consoleTrustedHosts`（`host:port` 精确匹配，或 `host` 匹配任意端口）。桥接会额外监听 `127.0.0.1` 供内部调用，Host/Origin 只对白名单地址放行，控制台令牌仍然必填。
+
 Windows 也可双击 `start.bat` 以守护模式运行，关闭窗口即停止。
 
 ## 文档与开发
@@ -96,7 +98,7 @@ npm run test:audit
 
 - 仅在知情并获准的会话中使用，遵守平台规则；使用非官方 QQ 后端可能导致账号受限。
 - 聊天内容会经 DSH 发送给所配置的模型服务；黑话自动研究默认开启，可能将提取的关键词发送给搜索服务。数据流与关闭方式见 [NOTICE](NOTICE.md#四数据传输)。
-- 保护 `config.json`、`state/` 与控制台令牌，保持服务仅在本机可访问。
+- 保护 `config.json`、`state/` 与控制台令牌；控制台默认只监听本机回环，只有显式设置 `consoleHost` 时才对指定网卡地址开放（仍需令牌）。
 - 本工具不实现 QQ 登录或底层协议，不安装、打包或启停 SnowLuma 后端；当前客户端仍依赖 `@snowluma/sdk` 等包，第三方组件适用各自条款。
 
 当前代码按 [PolyForm Noncommercial 1.0.0](LICENSE) 提供，限非商业用途；`v0.2.1-r1` 及更早已发布版本沿用其发布时的 MIT 许可。第三方组件、独立关系与使用风险见 [NOTICE](NOTICE.md)。

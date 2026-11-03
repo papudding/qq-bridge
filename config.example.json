@@ -44,6 +44,8 @@
   "sendDelayMs": 300,
   "questionTimeoutMs": 300000,
   "consolePort": 3100,
+  "consoleHost": "127.0.0.1",
+  "consoleTrustedHosts": [],
   "consoleToken": "",
   "pricing": {
     "models": {
