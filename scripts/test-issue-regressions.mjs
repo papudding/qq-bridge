@@ -120,6 +120,40 @@ await test('#29 唤醒 prompt 必须写明机器人自己的昵称与 QQ 号', a
   } finally { await h.close(); }
 });
 
+await test('#29 账号昵称≠群昵称：身份提示要带群昵称，被叫群昵称也算 nameMention', async () => {
+  const h = await bridgeHarness();
+  try {
+    h.setSelfIdentity('账号昵称示例', '10001');
+    // 走真实刷新路径：群昵称由 get_group_member_info 提供（夹具返回「群昵称示例」）
+    assert.equal(await h.refreshSelfGroupNameV2(KEY), true, '应能从夹具网关取到群昵称');
+    assert.equal(h.selfGroupNameV2(KEY), '群昵称示例');
+
+    const line = h.selfIdentityTextV2(KEY);
+    assert.match(line, /账号昵称示例/, '账号昵称要保留');
+    assert.match(line, /群昵称示例/, '群昵称必须写进身份提示（消息里 @ 段渲染的是它）');
+    assert.match(line, /@群昵称示例/, '必须说明「@群昵称」指的是自己');
+    assert.match(line, /10001/);
+
+    const prompt = h.buildWakePromptV2(KEY, 'atMention');
+    assert.match(prompt, /【你的身份】/);
+    assert.match(prompt, /群昵称示例/, '每次唤醒的身份提示都要带群昵称');
+
+    // 群里 @ 渲染出来就是群昵称文本：只叫群昵称也必须触发 nameMention
+    const st = h.getSocialV2State(KEY);
+    // 概率触发是随机项，会掩盖「不该唤醒」的断言，这里钉成 0。
+    st.wakeConfig.triggers.probability = 0;
+    const reasonOf = (text) => h.evaluateWakeTriggerV2(KEY, st, {}, 'group', text, text, false);
+    assert.equal(reasonOf('@群昵称示例 在吗'), 'nameMention', '@群昵称必须算叫自己');
+    assert.equal(reasonOf('群昵称示例 出来'), 'nameMention', '直接叫群昵称必须算叫自己');
+    assert.equal(reasonOf('今天天气不错'), null, '没叫自己、没关键词时不能误唤醒');
+
+    // 私聊没有群昵称：退回账号昵称，不能把别的群昵称串进来
+    const priv = h.selfIdentityTextV2('private:10001');
+    assert.match(priv, /账号昵称示例/);
+    assert.doesNotMatch(priv, /群昵称示例/);
+  } finally { await h.close(); }
+});
+
 await test('#角色卡注入：reserved2 唤醒提示必须带人格卡正文（旧实现只给角色名）', async () => {
   const h = await bridgeHarness({
     files: {

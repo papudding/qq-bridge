@@ -6017,6 +6017,8 @@ async function main() {
           if (cfg.socialV2?.sticker?.enabled !== false) {
             try { await syncStickerLibrary(false); } catch {}
           }
+          // 群昵称与账号昵称可能不同，身份提示要带本群群昵称（失败降级，不阻塞）。
+          try { await refreshSelfGroupNameV2(key); } catch {}
           const roleState = readRoleState();
           const toolMap = {
             getPrompt: 'qq_get_prompt',
@@ -6062,10 +6064,12 @@ async function main() {
             key,
             time: new Date().toISOString(),
             // 机器人自己的身份：agent 需要它才能把「@樰」对到自己身上（issue #29）。
+            // 群昵称与账号昵称可能不同，两个都给（@ 段渲染的是群昵称）。
             self: {
               nickname: selfDisplayName || null,
+              groupNickname: selfGroupNameV2(key) || null,
               userId: selfUserId || null,
-              line: selfIdentityTextV2().trim() || null
+              line: selfIdentityTextV2(key).trim() || null
             },
             role: { name: roleState.role ?? null, hint: currentMode === 'reserved2' ? currentRoleHintV2() : currentRoleHint() },
             recommended: cfg.socialV2?.provideRecommendations === false ? null : {
@@ -10161,6 +10165,11 @@ async function main() {
   // 于是会把 @自己 当成 @别人、已读不回（issue #29）。昵称与 QQ 号要显式写进 prompt。
   let selfDisplayName = '';
   let selfUserId = '';
+  // 机器人在每个群里的群昵称（get_group_member_info 的 card || nickname）：账号昵称与群内
+  // 昵称可能完全不同（账号昵称来自 get_login_info，群昵称来自群成员信息）。消息
+  // 渲染时 @ 段解析的是群内昵称，身份提示只给账号昵称会让 agent 把「@群昵称」当成别人（#29）。
+  const selfGroupNames = new Map(); // groupId -> { name, ts }
+  const SELF_GROUP_NAME_TTL_MS = 5 * 60 * 1000;
   const SILENT_TURN_TIMEOUT_MS = 300000; // 摘要静默名额 5 分钟未消费则作废，避免吞掉后续正常回复
   const social = {
     states: new Map(),             // key -> { phase: 'idle'|'active'|'probing'|'exiting', lastCheckAt, nextCheckAt, lastActiveMessageAt, activeEnteredAt, activeDeadlineAt, activeExitAt, probeDeadline }
@@ -12166,8 +12175,15 @@ async function main() {
     if (tr.nameMention && selfNickname) {
       // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
       // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
+      // 称呼取账号昵称 + 本群群昵称：群里 @ 渲染出来的是群昵称，只认账号昵称会漏触发。
+      // 身份尚未取到（网关登录信息失败）时退回旧行为：用默认昵称 selfNickname 匹配。
       const lower = String(plainContent ?? '').toLowerCase();
-      if (lower.includes('@' + selfNickname.toLowerCase()) || lower.includes(selfNickname.toLowerCase())) return 'nameMention';
+      const names = selfAliasNamesV2(key);
+      if (!names.length && selfNickname) names.push(selfNickname);
+      for (const alias of names) {
+        const name = alias.toLowerCase();
+        if (name && (lower.includes('@' + name) || lower.includes(name))) return 'nameMention';
+      }
     }
     if (Array.isArray(tr.keywords) && tr.keywords.length) {
       const lower = String(plainContent ?? '').toLowerCase();
@@ -12392,20 +12408,93 @@ async function main() {
     return { purpose: 'reply', quietMs, remainingQuietMs: Math.max(0, quietMs - elapsedMs) };
   }
 
+  function groupIdOfKeyV2(key) {
+    const m = /^group:(\d+)$/.exec(String(key ?? ''));
+    return m ? m[1] : '';
+  }
+
+  // 当前群里的群昵称（#29：群内 @ 段用的是这个，不是账号昵称）。
+  function selfGroupNameV2(key) {
+    const gid = groupIdOfKeyV2(key);
+    if (!gid) return '';
+    return String(selfGroupNames.get(gid)?.name ?? '').trim();
+  }
+
+  // 机器人自己的所有称呼：账号昵称 + 当前群群昵称（去重、保留原始大小写）。
+  // 「被叫到名字」的判断与身份提示都基于它，否则群里叫群昵称时会被当成别人。
+  function selfAliasNamesV2(key = '') {
+    const names = [];
+    const add = (value) => {
+      const name = String(value ?? '').trim();
+      if (!name) return;
+      if (names.some((n) => n.toLowerCase() === name.toLowerCase())) return;
+      names.push(name);
+    };
+    add(selfDisplayName);
+    add(selfGroupNameV2(key));
+    return names;
+  }
+
+  // 拉取机器人在某个群的群昵称。失败（网关未实现/未连接）时静默降级到账号昵称，
+  // 不阻塞唤醒；TTL 内直接复用缓存，避免每次唤醒都多一次 OneBot 往返。
+  async function refreshSelfGroupNameV2(key, { force = false } = {}) {
+    const gid = groupIdOfKeyV2(key);
+    if (!gid) return false;
+    if (!selfUserId) {
+      try {
+        const login = await bot.getLoginInfo();
+        if (login?.user_id != null) selfUserId = String(login.user_id);
+        if (login?.nickname) {
+          const name = String(login.nickname).trim();
+          selfDisplayName = name;
+          selfNickname = name.toLowerCase();
+        }
+      } catch {
+        return false;
+      }
+    }
+    if (!selfUserId) return false;
+    const hit = selfGroupNames.get(gid);
+    if (!force && hit && Date.now() - hit.ts < SELF_GROUP_NAME_TTL_MS) return true;
+    try {
+      const info = await bot.getGroupMemberInfo(Number(gid), Number(selfUserId));
+      // 与消息渲染的 @ 解析保持一致：优先群名片，其次群昵称。
+      const name = String(info?.card || info?.nickname || '').trim();
+      if (name) {
+        if (hit?.name !== name) log(`机器人群昵称: ${name}（群 ${gid}，账号昵称 ${selfDisplayName || '未知'}）`);
+        selfGroupNames.set(gid, { name, ts: Date.now() });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // 连接成功/收到 login info 后预热所有白名单群的群昵称（不 await，失败无感）。
+  function refreshSelfGroupNamesV2() {
+    const groups = Array.isArray(cfg.allow?.groups) ? cfg.allow.groups : [];
+    for (const gid of groups) void refreshSelfGroupNameV2(`group:${gid}`, { force: true });
+  }
+
   // 机器人自己的身份（昵称 + QQ 号）。**必须显式写进 prompt**：
   // agent 能看到的消息里只有 "@樰" 这串文本，没人告诉它"樰"就是它自己，于是它会把
-  // @自己 当成 @别人、已读不回（issue #29）。群名片可能与昵称不同，但 at/引用段里
-  // 带的是 QQ 号，所以两条都给。
-  function selfIdentityTextV2() {
-    const name = String(selfDisplayName || '').trim();
+  // @自己 当成 @别人、已读不回（issue #29）。账号昵称与群昵称可能不同（@ 段用的是群
+  // 昵称），at/引用段里带的是 QQ 号，所以所有称呼与 QQ 号都要给。
+  function selfIdentityTextV2(key = '') {
+    const accountName = String(selfDisplayName || '').trim();
+    const groupName = selfGroupNameV2(key);
+    const aliases = selfAliasNamesV2(key);
     const id = String(selfUserId || '').trim();
-    if (!name && !id) return '';
-    const label = name ? `「${name}」` : '（昵称未取到）';
+    if (!aliases.length && !id) return '';
     const idText = id ? `（QQ ${id}）` : '';
-    const callBits = name
-      ? `消息里出现「@${name}」、有人叫「${name}」、或引用你的消息，指的都是你 —— 不要当成别人`
+    const distinctGroupName = !!groupName && !!accountName && groupName.toLowerCase() !== accountName.toLowerCase();
+    const nameDetail = distinctGroupName
+      ? `你在 QQ 上的账号昵称是「${accountName}」，在本群的群昵称是「${groupName}」`
+      : `你在 QQ 上的昵称是${aliases.length ? aliases.map((name) => `「${name}」`).join(' / ') : '（昵称未取到）'}`;
+    const callBits = aliases.length
+      ? `消息里出现${aliases.map((name) => `「@${name}」`).join('、')}、有人叫${aliases.map((name) => `「${name}」`).join('、')}、或引用你的消息，指的都是你 —— 不要当成别人`
       : '被 @、被叫到你的昵称、或引用你的消息，指的都是你 —— 不要当成别人';
-    return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
+    return `【你的身份】${nameDetail}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
   function buildWakePromptV2(key, reason) {
@@ -12421,7 +12510,7 @@ async function main() {
         ? `【当前角色】${roleState.role}\n【角色卡 —— 以下是你的设定，必须按它说话，不要复述这份卡】\n${rolePick.text || '（角色卡为空，按仿真提示词行动）'}\n【角色卡结束】\n\n`
         : `${rolePick.text}\n\n`)
       : '';
-    const identityLine = selfIdentityTextV2();
+    const identityLine = selfIdentityTextV2(key);
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
@@ -12505,7 +12594,7 @@ async function main() {
     const roleLine = roleState.role
       ? `【当前角色】${roleState.role}（继续按角色卡说话）\n\n`
       : '';
-    const identityLine = selfIdentityTextV2();
+    const identityLine = selfIdentityTextV2(key);
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
@@ -12597,6 +12686,9 @@ async function main() {
     st.wakeConfig.wakeCount = (st.wakeConfig.wakeCount || 0) + 1;
     st.lastWakeReason = reason;
     saveSocialV2State();
+    // 群昵称可能被改过（也可能这次重启后还没取到）：唤醒前按 TTL 刷新一次，
+    // 失败不阻塞唤醒，身份提示会降级成账号昵称。
+    try { await refreshSelfGroupNameV2(key); } catch {}
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
     const rollbackWakeTime = () => {
@@ -14096,6 +14188,8 @@ async function main() {
         log(`机器人昵称: ${login.nickname}`);
       }
       if (login?.user_id != null) selfUserId = String(login.user_id);
+      // 账号昵称 ≠ 群昵称：预热所有白名单群的群昵称，身份提示与 nameMention 判断都要用。
+      if (selfUserId) refreshSelfGroupNamesV2();
     }).catch(() => {});
     // 连接成功后顺手确认一下 token 是否已跟当前账号对齐；不一致就写回 config.json，
     // 让 MCP 工具（另一个进程）也能拿到正确的 token。

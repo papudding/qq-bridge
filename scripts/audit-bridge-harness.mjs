@@ -109,6 +109,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   class FakeBot {
     async sendPrivateMessage(id, text) { calls.sent.push({ kind: 'private', id, text }); }
     async sendGroupMessage(id, text) { calls.sent.push({ kind: 'group', id, text }); }
+    // 机器人自己的账号信息与群昵称（#29：账号昵称与群昵称可能不同）。
+    async getLoginInfo() { return { user_id: 123, nickname: '夹具机器人' }; }
+    async getGroupMemberInfo(groupId, userId) {
+      // 与 SnowLuma 实际返回一致：群内昵称在 nickname，群名片可为空。
+      return { group_id: Number(groupId), user_id: Number(userId), nickname: '群昵称示例', card: '' };
+    }
     async getImage({ file }) {
       calls.images.push(file);
       // Valid 1 × 1 PNG, supplied entirely in memory by the fixture gateway.
@@ -178,11 +184,19 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES, bot,
     isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
+    evaluateWakeTriggerV2, refreshSelfGroupNameV2, selfGroupNameV2, selfAliasNamesV2,
     getMode() { return currentMode; },
     setSelfIdentity(display, id) {
       selfDisplayName = String(display ?? '');
       selfUserId = String(id ?? '');
       selfNickname = selfDisplayName.toLowerCase() || 'deepseek';
+    },
+    setSelfGroupName(groupId, name) {
+      const gid = String(groupId ?? '').trim();
+      if (!gid) return;
+      const value = String(name ?? '').trim();
+      if (value) selfGroupNames.set(gid, { name: value, ts: Date.now() });
+      else selfGroupNames.delete(gid);
     },
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
